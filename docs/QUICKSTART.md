@@ -59,5 +59,10 @@ LIVE_ORDER_MODE=1
 CONFIRM_LIVE_ORDERS=YES
 ALLOWED_SYMBOLS=CDSL,MOSCHIP
 MAX_NOTIONAL_PER_ORDER=100000
+REQUIRE_DB=1
+```
+Then run:
+```bash
+npm run live:check
 ```
 Use `HALT_TRADING=1` to stop new entries immediately.

@@ -6,11 +6,15 @@
 1. Ensure Postgres is up.
 2. Refresh Kite access token (`npm run auth`).
 3. Confirm `.env` risk limits and safety flags.
-4. Run live preflight:
+4. Run live checklist:
+```bash
+npm run live:check
+```
+5. Run live preflight:
 ```bash
 npm run preflight
 ```
-5. Run:
+6. Run:
 ```bash
 npm run morning
 ```
@@ -65,6 +69,7 @@ npm run reconcile
 
 ## Common Diagnostics
 - DB: `npm run db:check`
+- Live checklist: `npm run live:check`
 - Reports: `npm run db:report`
 - Strategy health: `npm run strategy:report`
 - Broker token errors: regenerate via `npm run auth`

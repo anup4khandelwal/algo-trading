@@ -72,6 +72,7 @@ npm run ui
 - `npm run morning`: daily workflow (`db:check -> reconcile -> demo -> db:report`)
 - `npm run live`: intraday loop mode
 - `npm run preflight`: validates live credentials/connectivity before order flow
+- `npm run live:check`: hard pre-live checklist (env safety, DB schema, market-hours policy, broker token)
 - `npm run monitor`: single monitor pass
 - `npm run entry`: single entry pass
 - `npm run eod:close`: square off all open positions
@@ -90,6 +91,7 @@ Use these env controls before enabling live orders:
 - Optional Telegram alerts:
   - `TELEGRAM_BOT_TOKEN`
   - `TELEGRAM_CHAT_ID`
+- `LIVE_CHECK_MARKET_POLICY=warn|strict` (`strict` fails checklist outside 09:15-15:30 IST)
 
 ## Recommended Daily Runbook
 1. Refresh token (`npm run auth`) before market open.
