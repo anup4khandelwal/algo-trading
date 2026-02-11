@@ -29,6 +29,7 @@ This repository is a TypeScript-based swing-trading platform for NSE equities wi
 - **Dashboard UI** (`src/ui/server.ts`) at `http://127.0.0.1:3000`.
 - **Live loop** (`src/live/live_loop.ts`) for intraday monitor cycles.
 - **Scripts** for DB checks, reconciliation, EOD close, strategy analytics, CSV export.
+- **Strategy Lab** (`src/strategy_lab/service.ts`) parameter sweep + robustness scoring + one-click apply from UI.
 
 ## Setup Guide
 
@@ -132,6 +133,9 @@ When `dashboard/dist/index.html` exists, `npm run ui` serves React UI by default
 - `npm run strategy:report`: win rate, avg R, drawdown, symbol stats
 - `npm run strategy:rebalance`: writes `.env.recommended`
 - `npm run backtest`: historical replay backtest + metrics + JSON export + DB snapshot
+- `POST /api/strategy-lab/run`: run Strategy Lab sweep from UI
+- `GET /api/strategy-lab/latest`: latest Strategy Lab run + candidates
+- `POST /api/strategy-lab/apply`: apply selected candidate params to `.env`
 - `npm run journal:export`: exports joined closed-trade + journal tags CSV
 - `npm run weekly`: report + rebalance + CSV export
 
@@ -167,6 +171,16 @@ Results:
 - JSON export at `exports/backtest-latest.json` (configurable via `BACKTEST_EXPORT_PATH`)
 - UI shows latest backtest in **Backtest Analytics**.
 
+## Strategy Lab
+- Trigger from dashboard action bar (`Strategy Lab`) or API `POST /api/strategy-lab/run`.
+- Each run stores:
+  - `strategy_lab_runs`
+  - `strategy_lab_candidates`
+  - `strategy_lab_recommendations`
+- UI card ranks candidates by robustness and guardrail checks.
+- `Apply Cxx` updates `.env` strategy keys and auto-enables Safe Mode + stops scheduler.
+- Sweep size is configurable via `STRATLAB_MAX_CANDIDATES` (default `15`).
+
 ## Trade Journal
 - UI section **Trade Journal** lets you tag closed lots with:
   - `setupTag`, `confidence (1-5)`, `mistakeTag`, notes, screenshot URL
@@ -183,7 +197,7 @@ npm run journal:export
 ## UI Scheduler Automation
 From UI (`http://127.0.0.1:3000`) you can:
 - `Start Scheduler` / `Stop Scheduler`
-- run `Morning`, `Monitor`, `EOD Close`, and `Backtest` directly
+- run `Morning`, `Monitor`, `EOD Close`, `Backtest`, and `Strategy Lab` directly
 
 Scheduler env (optional):
 - `SCHEDULER_ENABLED=1` to auto-start with UI server
@@ -192,6 +206,8 @@ Scheduler env (optional):
 - `SCHEDULER_EOD_AT=15:31`
 - `SCHEDULER_BACKTEST_WEEKDAY=Sat`
 - `SCHEDULER_BACKTEST_AT=10:30`
+- `SCHEDULER_STRATLAB_WEEKDAY=Sat`
+- `SCHEDULER_STRATLAB_AT=11:00`
 
 ## Live Health Panel
 UI now includes **Live Health** with:

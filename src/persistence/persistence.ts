@@ -80,6 +80,46 @@ export interface TradeJournalEntry {
   updatedAt: string;
 }
 
+export interface StrategyLabRunRecord {
+  id: number;
+  runId: string;
+  label?: string;
+  startedAt: string;
+  finishedAt?: string;
+  status: "running" | "completed" | "failed";
+  datasetWindow?: string;
+  notesJson?: string;
+  createdAt: string;
+}
+
+export interface StrategyLabCandidateRecord {
+  id: number;
+  runId: string;
+  candidateId: string;
+  paramsJson: string;
+  trades: number;
+  winRate: number;
+  avgR: number;
+  expectancy: number;
+  maxDrawdownPct: number;
+  cagrPct: number;
+  sharpeProxy: number;
+  stabilityScore: number;
+  robustnessScore: number;
+  guardrailPass: boolean;
+  guardrailReasonsJson?: string;
+  createdAt: string;
+}
+
+export interface StrategyLabRecommendationRecord {
+  id: number;
+  runId: string;
+  candidateId: string;
+  approvedForApply: boolean;
+  reasonJson?: string;
+  createdAt: string;
+}
+
 export interface Persistence {
   init(): Promise<void>;
   upsertOrder(order: Order): Promise<void>;
@@ -118,6 +158,20 @@ export interface Persistence {
     entry: Omit<TradeJournalEntry, "id" | "createdAt" | "updatedAt">
   ): Promise<void>;
   loadTradeJournalEntries(limit: number): Promise<TradeJournalEntry[]>;
+  insertStrategyLabRun(
+    run: Omit<StrategyLabRunRecord, "id" | "createdAt">
+  ): Promise<void>;
+  insertStrategyLabCandidate(
+    candidate: Omit<StrategyLabCandidateRecord, "id" | "createdAt">
+  ): Promise<void>;
+  upsertStrategyLabRecommendation(
+    rec: Omit<StrategyLabRecommendationRecord, "id" | "createdAt">
+  ): Promise<void>;
+  loadLatestStrategyLabRun(): Promise<StrategyLabRunRecord | null>;
+  loadStrategyLabCandidates(runId: string): Promise<StrategyLabCandidateRecord[]>;
+  loadStrategyLabRecommendation(
+    runId: string
+  ): Promise<StrategyLabRecommendationRecord | null>;
 }
 
 export class NoopPersistence implements Persistence {
@@ -177,5 +231,25 @@ export class NoopPersistence implements Persistence {
   ): Promise<void> {}
   async loadTradeJournalEntries(_limit: number): Promise<TradeJournalEntry[]> {
     return [];
+  }
+  async insertStrategyLabRun(
+    _run: Omit<StrategyLabRunRecord, "id" | "createdAt">
+  ): Promise<void> {}
+  async insertStrategyLabCandidate(
+    _candidate: Omit<StrategyLabCandidateRecord, "id" | "createdAt">
+  ): Promise<void> {}
+  async upsertStrategyLabRecommendation(
+    _rec: Omit<StrategyLabRecommendationRecord, "id" | "createdAt">
+  ): Promise<void> {}
+  async loadLatestStrategyLabRun(): Promise<StrategyLabRunRecord | null> {
+    return null;
+  }
+  async loadStrategyLabCandidates(_runId: string): Promise<StrategyLabCandidateRecord[]> {
+    return [];
+  }
+  async loadStrategyLabRecommendation(
+    _runId: string
+  ): Promise<StrategyLabRecommendationRecord | null> {
+    return null;
   }
 }

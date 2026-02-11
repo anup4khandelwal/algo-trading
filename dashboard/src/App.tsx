@@ -12,6 +12,8 @@ type StatusPayload = {
     eodAt?: string;
     backtestAt?: string;
     backtestWeekday?: string;
+    strategyLabAt?: string;
+    strategyLabWeekday?: string;
   };
 };
 
@@ -109,6 +111,34 @@ type BacktestPayload = {
     sharpeProxy: number;
     bySymbol?: Array<{ symbol: string; trades: number; winRate: number; avgR: number; pnl: number }>;
   } | null;
+};
+
+type StrategyLabPayload = {
+  enabled?: boolean;
+  latestRun?: { runId: string; createdAt?: string; status?: string; datasetWindow?: string } | null;
+  recommendation?: { candidateId: string; approvedForApply: boolean; reasons: string[] } | null;
+  candidates?: Array<{
+    candidateId: string;
+    params: {
+      minRsi: number;
+      breakoutBufferPct: number;
+      atrStopMultiple: number;
+      riskPerTrade: number;
+      minVolumeRatio: number;
+      maxSignals: number;
+    };
+    trades: number;
+    winRate: number;
+    avgR: number;
+    expectancy: number;
+    maxDrawdownPct: number;
+    cagrPct: number;
+    sharpeProxy: number;
+    stabilityScore: number;
+    robustnessScore: number;
+    guardrailPass: boolean;
+    guardrailReasons: string[];
+  }>;
 };
 
 type DriftPayload = {
@@ -219,6 +249,12 @@ const fallbackBroker: BrokerPayload = {
 
 const fallbackStrategy: StrategyPayload = { enabled: false, bySymbol: [] };
 const fallbackBacktest: BacktestPayload = { enabled: false, latest: null };
+const fallbackStrategyLab: StrategyLabPayload = {
+  enabled: false,
+  latestRun: null,
+  recommendation: null,
+  candidates: []
+};
 const fallbackDrift: DriftPayload = { enabled: false, summary: null, rows: [], message: "" };
 const fallbackJournal: JournalPayload = {
   enabled: false,
@@ -250,6 +286,7 @@ export default function App() {
   const [broker, setBroker] = useState<BrokerPayload>(fallbackBroker);
   const [strategy, setStrategy] = useState<StrategyPayload>(fallbackStrategy);
   const [backtest, setBacktest] = useState<BacktestPayload>(fallbackBacktest);
+  const [strategyLab, setStrategyLab] = useState<StrategyLabPayload>(fallbackStrategyLab);
   const [drift, setDrift] = useState<DriftPayload>(fallbackDrift);
   const [journal, setJournal] = useState<JournalPayload>(fallbackJournal);
   const [profileStatus, setProfileStatus] = useState<ProfileStatusPayload>(fallbackProfileStatus);
@@ -275,6 +312,7 @@ export default function App() {
   const [journalNotes, setJournalNotes] = useState("");
   const [journalScreenshot, setJournalScreenshot] = useState("");
   const [journalMsg, setJournalMsg] = useState("");
+  const [strategyLabMsg, setStrategyLabMsg] = useState("");
 
   const safeModeOn = status.safeMode?.enabled === true;
 
@@ -297,13 +335,14 @@ export default function App() {
   }
 
   async function load() {
-    const [s, r, h, b, st, bt, dr, jr, ps, pr, po, eod] = await Promise.all([
+    const [s, r, h, b, st, bt, sl, dr, jr, ps, pr, po, eod] = await Promise.all([
       fetchJson<StatusPayload>("/api/status", fallbackStatus),
       fetchJson<ReportPayload>("/api/report", fallbackReport),
       fetchJson<HealthPayload>("/api/health", fallbackHealth),
       fetchJson<BrokerPayload>(`/api/broker/orders?${brokerQuery()}`, fallbackBroker),
       fetchJson<StrategyPayload>("/api/strategy", fallbackStrategy),
       fetchJson<BacktestPayload>("/api/backtest", fallbackBacktest),
+      fetchJson<StrategyLabPayload>("/api/strategy-lab/latest", fallbackStrategyLab),
       fetchJson<DriftPayload>("/api/drift", fallbackDrift),
       fetchJson<JournalPayload>("/api/journal", fallbackJournal),
       fetchJson<ProfileStatusPayload>("/api/profile/status", fallbackProfileStatus),
@@ -317,6 +356,7 @@ export default function App() {
     setBroker(b);
     setStrategy(st);
     setBacktest(bt);
+    setStrategyLab(sl);
     setDrift(dr);
     setJournal(jr);
     setProfileStatus(ps);
@@ -462,6 +502,30 @@ export default function App() {
     }
   }
 
+  async function applyStrategyCandidate(candidateId: string) {
+    const ok = window.confirm(
+      `Apply ${candidateId}? Strategy params in .env will update, scheduler will stop, Safe Mode will be enabled.`
+    );
+    if (!ok) return;
+    setBusy(true);
+    try {
+      const res = await fetch("/api/strategy-lab/apply", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ candidateId })
+      });
+      const body = (await res.json()) as { error?: string; ok?: boolean };
+      if (!res.ok || body.ok !== true) {
+        setStrategyLabMsg(body.error ?? "Apply failed");
+      } else {
+        setStrategyLabMsg(`Applied ${candidateId}. Safe Mode enabled.`);
+      }
+      await load();
+    } finally {
+      setBusy(false);
+    }
+  }
+
   const eqPoints = useMemo(() => {
     const rows = [...(report.dailySnapshots ?? [])].reverse();
     if (rows.length < 2) return "";
@@ -524,6 +588,7 @@ export default function App() {
         <button disabled={busy} onClick={() => void postAction("/api/run/preflight")} className="btn">Preflight</button>
         <button disabled={busy} onClick={() => void postAction("/api/run/eod")} className="btn">EOD</button>
         <button disabled={busy} onClick={() => void postAction("/api/run/backtest")} className="btn">Backtest</button>
+        <button disabled={busy} onClick={() => void postAction("/api/strategy-lab/run")} className="btn">Strategy Lab</button>
         <button disabled={busy || safeModeOn} onClick={() => void postAction("/api/scheduler/start")} className="btn">Start Scheduler</button>
         <button disabled={busy} onClick={() => void postAction("/api/scheduler/stop")} className="btn">Stop Scheduler</button>
         <button disabled={busy || safeModeOn} onClick={() => void postAction("/api/safe-mode/enable", { reason: "React dashboard toggle" })} className="btn btn-danger">Enable Safe Mode</button>
@@ -685,6 +750,39 @@ export default function App() {
               />
             </>
           )}
+        </Card>
+
+        <Card title="Strategy Lab" span="wide">
+          <div className="meta-line">
+            Run: {strategyLab.latestRun?.runId ?? "n/a"} | Status: {strategyLab.latestRun?.status ?? "n/a"} | Window: {strategyLab.latestRun?.datasetWindow ?? "n/a"}
+          </div>
+          <div className="meta-line">
+            Recommendation: {strategyLab.recommendation?.candidateId ?? "n/a"} ({strategyLab.recommendation?.approvedForApply ? "Approved" : "Review"})
+            {strategyLab.recommendation?.reasons?.length ? ` | ${strategyLab.recommendation.reasons.join(", ")}` : ""}
+          </div>
+          <div className="meta-line">{strategyLabMsg}</div>
+          <SimpleTable
+            columns={["id", "robust", "stability", "trades", "winRate", "avgR", "maxDD%", "cagr%", "sharpe", "guardrail"]}
+            rows={(strategyLab.candidates ?? []).slice(0, 10).map((x) => [
+              x.candidateId,
+              num(x.robustnessScore, 2),
+              num(x.stabilityScore, 2),
+              String(x.trades),
+              pct(x.winRate),
+              num(x.avgR, 3),
+              num(x.maxDrawdownPct * 100, 2),
+              num(x.cagrPct, 2),
+              num(x.sharpeProxy, 3),
+              x.guardrailPass ? "PASS" : `FAIL (${(x.guardrailReasons ?? []).join("|")})`
+            ])}
+          />
+          <div className="actions-inline" style={{ marginTop: 10 }}>
+            {(strategyLab.candidates ?? []).slice(0, 5).map((x) => (
+              <button key={x.candidateId} className="btn" disabled={busy} onClick={() => void applyStrategyCandidate(x.candidateId)}>
+                Apply {x.candidateId}
+              </button>
+            ))}
+          </div>
         </Card>
 
         <Card title="Live vs Backtest Drift" span="wide" subtitle={drift.message ?? ""}>

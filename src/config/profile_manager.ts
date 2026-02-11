@@ -71,6 +71,20 @@ export async function applyProfile(name: ProfileName) {
   };
 }
 
+export async function applyEnvOverrides(values: Record<string, string>) {
+  const current = await loadCurrentEnvMap();
+  const next = { ...current, ...values };
+  await writeFile(envPath(), dumpEnv(next), "utf-8");
+  for (const [k, v] of Object.entries(values)) {
+    process.env[k] = v;
+  }
+  return {
+    appliedKeys: Object.keys(values).length,
+    updatedAt: new Date().toISOString(),
+    envPath: envPath()
+  };
+}
+
 export function listProfiles() {
   return PROFILE_NAMES;
 }

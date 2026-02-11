@@ -1,4 +1,9 @@
-export type SchedulerJobName = "morning" | "monitor" | "eod_close" | "backtest";
+export type SchedulerJobName =
+  | "morning"
+  | "monitor"
+  | "eod_close"
+  | "backtest"
+  | "strategy_lab";
 
 type SchedulerState = {
   enabled: boolean;
@@ -8,6 +13,8 @@ type SchedulerState = {
   eodAt: string;
   backtestAt: string;
   backtestWeekday: string;
+  strategyLabAt: string;
+  strategyLabWeekday: string;
   lastRuns: Partial<Record<SchedulerJobName, string>>;
   lastErrors: Partial<Record<SchedulerJobName, string>>;
 };
@@ -17,6 +24,7 @@ type SchedulerHandlers = {
   runMonitor: () => Promise<void>;
   runEodClose: () => Promise<void>;
   runBacktest: () => Promise<void>;
+  runStrategyLab: () => Promise<void>;
   canRun: () => boolean;
 };
 
@@ -36,6 +44,8 @@ export class TradingScheduler {
       eodAt: string;
       backtestAt: string;
       backtestWeekday: string;
+      strategyLabAt: string;
+      strategyLabWeekday: string;
     }
   ) {}
 
@@ -70,6 +80,8 @@ export class TradingScheduler {
       eodAt: this.cfg.eodAt,
       backtestAt: this.cfg.backtestAt,
       backtestWeekday: this.cfg.backtestWeekday,
+      strategyLabAt: this.cfg.strategyLabAt,
+      strategyLabWeekday: this.cfg.strategyLabWeekday,
       lastRuns: this.lastRuns,
       lastErrors: this.lastErrors
     };
@@ -100,6 +112,10 @@ export class TradingScheduler {
 
     if (p.weekday === this.cfg.backtestWeekday && atTime(p, this.cfg.backtestAt)) {
       await this.tryRun("backtest", `backtest:${p.date}`, this.handlers.runBacktest);
+    }
+
+    if (p.weekday === this.cfg.strategyLabWeekday && atTime(p, this.cfg.strategyLabAt)) {
+      await this.tryRun("strategy_lab", `strategy-lab:${p.date}`, this.handlers.runStrategyLab);
     }
   }
 

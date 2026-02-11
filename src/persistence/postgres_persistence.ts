@@ -7,6 +7,9 @@ import {
   DailySnapshot,
   ManagedPositionRecord,
   Persistence,
+  StrategyLabCandidateRecord,
+  StrategyLabRecommendationRecord,
+  StrategyLabRunRecord,
   TradeJournalEntry
 } from "./persistence.js";
 import { ReconcileAudit } from "./persistence.js";
@@ -139,6 +142,53 @@ export class PostgresPersistence implements Persistence {
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+
+      CREATE TABLE IF NOT EXISTS strategy_lab_runs (
+        id BIGSERIAL PRIMARY KEY,
+        run_id TEXT NOT NULL UNIQUE,
+        label TEXT,
+        started_at TIMESTAMPTZ NOT NULL,
+        finished_at TIMESTAMPTZ,
+        status TEXT NOT NULL,
+        dataset_window TEXT,
+        notes_json TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS strategy_lab_candidates (
+        id BIGSERIAL PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        candidate_id TEXT NOT NULL,
+        params_json TEXT NOT NULL,
+        trades INTEGER NOT NULL,
+        win_rate DOUBLE PRECISION NOT NULL,
+        avg_r DOUBLE PRECISION NOT NULL,
+        expectancy DOUBLE PRECISION NOT NULL,
+        max_drawdown_pct DOUBLE PRECISION NOT NULL,
+        cagr_pct DOUBLE PRECISION NOT NULL,
+        sharpe_proxy DOUBLE PRECISION NOT NULL,
+        stability_score DOUBLE PRECISION NOT NULL,
+        robustness_score DOUBLE PRECISION NOT NULL,
+        guardrail_pass BOOLEAN NOT NULL,
+        guardrail_reasons_json TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (run_id, candidate_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS strategy_lab_recommendations (
+        id BIGSERIAL PRIMARY KEY,
+        run_id TEXT NOT NULL UNIQUE,
+        candidate_id TEXT NOT NULL,
+        approved_for_apply BOOLEAN NOT NULL,
+        reason_json TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_strategy_lab_runs_created_at
+      ON strategy_lab_runs (created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_strategy_lab_candidates_run
+      ON strategy_lab_candidates (run_id, robustness_score DESC);
     `);
   }
 
@@ -630,6 +680,183 @@ export class PostgresPersistence implements Persistence {
       createdAt: new Date(row.created_at).toISOString(),
       updatedAt: new Date(row.updated_at).toISOString()
     }));
+  }
+
+  async insertStrategyLabRun(
+    run: Omit<StrategyLabRunRecord, "id" | "createdAt">
+  ): Promise<void> {
+    await this.pool.query(
+      `
+      INSERT INTO strategy_lab_runs (
+        run_id, label, started_at, finished_at, status, dataset_window, notes_json
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7)
+      ON CONFLICT (run_id)
+      DO UPDATE SET
+        label = EXCLUDED.label,
+        started_at = EXCLUDED.started_at,
+        finished_at = EXCLUDED.finished_at,
+        status = EXCLUDED.status,
+        dataset_window = EXCLUDED.dataset_window,
+        notes_json = EXCLUDED.notes_json
+      `,
+      [
+        run.runId,
+        run.label ?? null,
+        run.startedAt,
+        run.finishedAt ?? null,
+        run.status,
+        run.datasetWindow ?? null,
+        run.notesJson ?? null
+      ]
+    );
+  }
+
+  async insertStrategyLabCandidate(
+    candidate: Omit<StrategyLabCandidateRecord, "id" | "createdAt">
+  ): Promise<void> {
+    await this.pool.query(
+      `
+      INSERT INTO strategy_lab_candidates (
+        run_id, candidate_id, params_json, trades, win_rate, avg_r, expectancy,
+        max_drawdown_pct, cagr_pct, sharpe_proxy, stability_score, robustness_score,
+        guardrail_pass, guardrail_reasons_json
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+      ON CONFLICT (run_id, candidate_id)
+      DO UPDATE SET
+        params_json = EXCLUDED.params_json,
+        trades = EXCLUDED.trades,
+        win_rate = EXCLUDED.win_rate,
+        avg_r = EXCLUDED.avg_r,
+        expectancy = EXCLUDED.expectancy,
+        max_drawdown_pct = EXCLUDED.max_drawdown_pct,
+        cagr_pct = EXCLUDED.cagr_pct,
+        sharpe_proxy = EXCLUDED.sharpe_proxy,
+        stability_score = EXCLUDED.stability_score,
+        robustness_score = EXCLUDED.robustness_score,
+        guardrail_pass = EXCLUDED.guardrail_pass,
+        guardrail_reasons_json = EXCLUDED.guardrail_reasons_json
+      `,
+      [
+        candidate.runId,
+        candidate.candidateId,
+        candidate.paramsJson,
+        candidate.trades,
+        candidate.winRate,
+        candidate.avgR,
+        candidate.expectancy,
+        candidate.maxDrawdownPct,
+        candidate.cagrPct,
+        candidate.sharpeProxy,
+        candidate.stabilityScore,
+        candidate.robustnessScore,
+        candidate.guardrailPass,
+        candidate.guardrailReasonsJson ?? null
+      ]
+    );
+  }
+
+  async upsertStrategyLabRecommendation(
+    rec: Omit<StrategyLabRecommendationRecord, "id" | "createdAt">
+  ): Promise<void> {
+    await this.pool.query(
+      `
+      INSERT INTO strategy_lab_recommendations (run_id, candidate_id, approved_for_apply, reason_json)
+      VALUES ($1,$2,$3,$4)
+      ON CONFLICT (run_id)
+      DO UPDATE SET
+        candidate_id = EXCLUDED.candidate_id,
+        approved_for_apply = EXCLUDED.approved_for_apply,
+        reason_json = EXCLUDED.reason_json
+      `,
+      [rec.runId, rec.candidateId, rec.approvedForApply, rec.reasonJson ?? null]
+    );
+  }
+
+  async loadLatestStrategyLabRun(): Promise<StrategyLabRunRecord | null> {
+    const { rows } = await this.pool.query(
+      `
+      SELECT id, run_id, label, started_at, finished_at, status, dataset_window, notes_json, created_at
+      FROM strategy_lab_runs
+      ORDER BY created_at DESC
+      LIMIT 1
+      `
+    );
+    if (rows.length === 0) {
+      return null;
+    }
+    const row = rows[0];
+    return {
+      id: Number(row.id),
+      runId: row.run_id,
+      label: row.label ?? undefined,
+      startedAt: new Date(row.started_at).toISOString(),
+      finishedAt: row.finished_at ? new Date(row.finished_at).toISOString() : undefined,
+      status: row.status,
+      datasetWindow: row.dataset_window ?? undefined,
+      notesJson: row.notes_json ?? undefined,
+      createdAt: new Date(row.created_at).toISOString()
+    };
+  }
+
+  async loadStrategyLabCandidates(runId: string): Promise<StrategyLabCandidateRecord[]> {
+    const { rows } = await this.pool.query(
+      `
+      SELECT
+        id, run_id, candidate_id, params_json, trades, win_rate, avg_r, expectancy,
+        max_drawdown_pct, cagr_pct, sharpe_proxy, stability_score, robustness_score,
+        guardrail_pass, guardrail_reasons_json, created_at
+      FROM strategy_lab_candidates
+      WHERE run_id = $1
+      ORDER BY robustness_score DESC, created_at ASC
+      `,
+      [runId]
+    );
+    return rows.map((row) => ({
+      id: Number(row.id),
+      runId: row.run_id,
+      candidateId: row.candidate_id,
+      paramsJson: row.params_json,
+      trades: Number(row.trades),
+      winRate: Number(row.win_rate),
+      avgR: Number(row.avg_r),
+      expectancy: Number(row.expectancy),
+      maxDrawdownPct: Number(row.max_drawdown_pct),
+      cagrPct: Number(row.cagr_pct),
+      sharpeProxy: Number(row.sharpe_proxy),
+      stabilityScore: Number(row.stability_score),
+      robustnessScore: Number(row.robustness_score),
+      guardrailPass: Boolean(row.guardrail_pass),
+      guardrailReasonsJson: row.guardrail_reasons_json ?? undefined,
+      createdAt: new Date(row.created_at).toISOString()
+    }));
+  }
+
+  async loadStrategyLabRecommendation(
+    runId: string
+  ): Promise<StrategyLabRecommendationRecord | null> {
+    const { rows } = await this.pool.query(
+      `
+      SELECT id, run_id, candidate_id, approved_for_apply, reason_json, created_at
+      FROM strategy_lab_recommendations
+      WHERE run_id = $1
+      LIMIT 1
+      `,
+      [runId]
+    );
+    if (rows.length === 0) {
+      return null;
+    }
+    const row = rows[0];
+    return {
+      id: Number(row.id),
+      runId: row.run_id,
+      candidateId: row.candidate_id,
+      approvedForApply: Boolean(row.approved_for_apply),
+      reasonJson: row.reason_json ?? undefined,
+      createdAt: new Date(row.created_at).toISOString()
+    };
   }
 }
 

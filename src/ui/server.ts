@@ -15,11 +15,13 @@ import {
 import { PostgresPersistence } from "../persistence/postgres_persistence.js";
 import { NoopPersistence } from "../persistence/persistence.js";
 import { runConfiguredBacktest } from "../backtest/service.js";
+import { runStrategyLabSweep } from "../strategy_lab/service.js";
 import { TradingScheduler } from "../ops/scheduler.js";
 import { ZerodhaAdapter } from "../execution/zerodha_adapter.js";
 import { MapLtpProvider } from "../market_data/ltp_provider.js";
 import { buildAlerter } from "../ops/alerter.js";
 import {
+  applyEnvOverrides,
   applyProfile,
   getProfileSnapshot,
   type ProfileName
@@ -30,7 +32,13 @@ dotenv.config();
 const PORT = Number(process.env.UI_PORT ?? "3000");
 const REACT_DIST_DIR = path.resolve(process.cwd(), "dashboard", "dist");
 const HAS_REACT_BUILD = existsSync(path.join(REACT_DIST_DIR, "index.html"));
-type UiJob = "morning" | "monitor" | "preflight" | "backtest" | "eod_close";
+type UiJob =
+  | "morning"
+  | "monitor"
+  | "preflight"
+  | "backtest"
+  | "eod_close"
+  | "strategy_lab";
 type BrokerOrdersReport = {
   enabled: boolean;
   stale: boolean;
@@ -84,6 +92,7 @@ const scheduler = new TradingScheduler(
     runMonitor: () => runUiJob("monitor", "SCHED_MONITOR", () => runMonitorPass()),
     runEodClose: () => runUiJob("eod_close", "SCHED_EOD", () => runEodClosePass()),
     runBacktest: () => runUiJob("backtest", "SCHED_BACKTEST", () => runConfiguredBacktest()),
+    runStrategyLab: () => runUiJob("strategy_lab", "SCHED_STRATEGY_LAB", () => runStrategyLabAndPersist()),
     canRun: () => runningJob === null
   },
   {
@@ -92,7 +101,9 @@ const scheduler = new TradingScheduler(
     premarketAt: process.env.SCHEDULER_PREMARKET_AT ?? "08:55",
     eodAt: process.env.SCHEDULER_EOD_AT ?? "15:31",
     backtestAt: process.env.SCHEDULER_BACKTEST_AT ?? "10:30",
-    backtestWeekday: process.env.SCHEDULER_BACKTEST_WEEKDAY ?? "Sat"
+    backtestWeekday: process.env.SCHEDULER_BACKTEST_WEEKDAY ?? "Sat",
+    strategyLabAt: process.env.SCHEDULER_STRATLAB_AT ?? "11:00",
+    strategyLabWeekday: process.env.SCHEDULER_STRATLAB_WEEKDAY ?? "Sat"
   }
 );
 if (process.env.SCHEDULER_ENABLED === "1") {
@@ -207,6 +218,12 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (method === "GET" && url.pathname === "/api/strategy-lab/latest") {
+      const data = await getStrategyLabReport();
+      json(res, 200, data);
+      return;
+    }
+
     if (method === "GET" && url.pathname === "/api/drift") {
       const drift = await getDriftReport();
       json(res, 200, drift);
@@ -244,6 +261,29 @@ const server = http.createServer(async (req, res) => {
       if (!launchJob(res, "backtest", "BACKTEST_JOB", () => runConfiguredBacktest())) {
         return;
       }
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/api/strategy-lab/run") {
+      if (!launchJob(res, "strategy_lab", "STRATLAB_JOB", () => runStrategyLabAndPersist())) {
+        return;
+      }
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/api/strategy-lab/apply") {
+      const body = await readJsonBody(req);
+      const candidateId = String(body?.candidateId ?? "").trim();
+      if (!candidateId) {
+        json(res, 400, { error: "candidateId is required" });
+        return;
+      }
+      const applied = await applyStrategyLabCandidate(candidateId);
+      if (!applied.ok) {
+        json(res, 400, applied);
+        return;
+      }
+      json(res, 200, applied);
       return;
     }
 
@@ -934,6 +974,154 @@ async function getBacktestReport() {
     maybeLogDbError(err);
     return { enabled: false, latest: null };
   }
+}
+
+async function runStrategyLabAndPersist() {
+  const output = await runStrategyLabSweep();
+  const databaseUrl = process.env.DATABASE_URL;
+  if (databaseUrl) {
+    const persistence = new PostgresPersistence(databaseUrl);
+    await persistence.init();
+    await persistence.insertStrategyLabRun({
+      runId: output.runId,
+      label: output.label,
+      startedAt: output.startedAt,
+      finishedAt: output.finishedAt,
+      status: "completed",
+      datasetWindow: output.datasetWindow,
+      notesJson: JSON.stringify({ candidateCount: output.candidates.length })
+    });
+    for (const candidate of output.candidates) {
+      await persistence.insertStrategyLabCandidate({
+        runId: output.runId,
+        candidateId: candidate.candidateId,
+        paramsJson: JSON.stringify(candidate.params),
+        trades: candidate.trades,
+        winRate: candidate.winRate,
+        avgR: candidate.avgR,
+        expectancy: candidate.expectancy,
+        maxDrawdownPct: candidate.maxDrawdownPct,
+        cagrPct: candidate.cagrPct,
+        sharpeProxy: candidate.sharpeProxy,
+        stabilityScore: candidate.stabilityScore,
+        robustnessScore: candidate.robustnessScore,
+        guardrailPass: candidate.guardrailPass,
+        guardrailReasonsJson: JSON.stringify(candidate.guardrailReasons)
+      });
+    }
+    await persistence.upsertStrategyLabRecommendation({
+      runId: output.runId,
+      candidateId: output.recommendation.candidateId,
+      approvedForApply: output.recommendation.approvedForApply,
+      reasonJson: JSON.stringify(output.recommendation.reasons)
+    });
+    await persistence.upsertSystemState("last_strategy_lab_run", output.runId);
+  }
+  await notifyOpsAlert("info", "strategy_lab_run_completed", "Strategy Lab run completed", {
+    runId: output.runId,
+    candidates: output.candidates.length,
+    recommendation: output.recommendation
+  });
+  return output;
+}
+
+async function getStrategyLabReport() {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) {
+    return {
+      enabled: false,
+      latestRun: null,
+      recommendation: null,
+      candidates: []
+    };
+  }
+  const persistence = new PostgresPersistence(databaseUrl);
+  try {
+    await persistence.init();
+    const latestRun = await persistence.loadLatestStrategyLabRun();
+    if (!latestRun) {
+      return {
+        enabled: true,
+        latestRun: null,
+        recommendation: null,
+        candidates: []
+      };
+    }
+    const [candidates, recommendation] = await Promise.all([
+      persistence.loadStrategyLabCandidates(latestRun.runId),
+      persistence.loadStrategyLabRecommendation(latestRun.runId)
+    ]);
+    return {
+      enabled: true,
+      latestRun,
+      recommendation: recommendation
+        ? {
+            candidateId: recommendation.candidateId,
+            approvedForApply: recommendation.approvedForApply,
+            reasons: parseJsonArray(recommendation.reasonJson)
+          }
+        : null,
+      candidates: candidates.map((x) => ({
+        candidateId: x.candidateId,
+        params: parseCandidateParams(x.paramsJson),
+        trades: x.trades,
+        winRate: x.winRate,
+        avgR: x.avgR,
+        expectancy: x.expectancy,
+        maxDrawdownPct: x.maxDrawdownPct,
+        cagrPct: x.cagrPct,
+        sharpeProxy: x.sharpeProxy,
+        stabilityScore: x.stabilityScore,
+        robustnessScore: x.robustnessScore,
+        guardrailPass: x.guardrailPass,
+        guardrailReasons: parseJsonArray(x.guardrailReasonsJson)
+      }))
+    };
+  } catch (err) {
+    maybeLogDbError(err);
+    return {
+      enabled: false,
+      latestRun: null,
+      recommendation: null,
+      candidates: []
+    };
+  }
+}
+
+async function applyStrategyLabCandidate(candidateId: string) {
+  const report = await getStrategyLabReport();
+  if (!report.enabled) {
+    return { ok: false, error: "Strategy Lab data not available" };
+  }
+  const selected = (report.candidates ?? []).find((x) => x.candidateId === candidateId);
+  if (!selected) {
+    return { ok: false, error: `Candidate ${candidateId} not found in latest Strategy Lab run` };
+  }
+
+  const updates: Record<string, string> = {
+    STRATEGY_MIN_RSI: String(Math.round(selected.params.minRsi)),
+    STRATEGY_BREAKOUT_BUFFER_PCT: roundToStr(selected.params.breakoutBufferPct, 4),
+    ATR_STOP_MULTIPLE: roundToStr(selected.params.atrStopMultiple, 2),
+    RISK_PER_TRADE: roundToStr(selected.params.riskPerTrade, 4),
+    STRATEGY_MIN_VOLUME_RATIO: roundToStr(selected.params.minVolumeRatio, 2),
+    STRATEGY_MAX_SIGNALS: String(Math.round(selected.params.maxSignals))
+  };
+  const applied = await applyEnvOverrides(updates);
+  scheduler.stop();
+  await setSafeMode(true, `Strategy Lab candidate ${candidateId} applied`, "strategy_lab_apply");
+  await notifyOpsAlert("warning", "strategy_lab_applied", `Applied Strategy Lab candidate ${candidateId}`, {
+    candidateId,
+    params: selected.params,
+    approvedForApply: report.recommendation?.approvedForApply ?? false
+  });
+  return {
+    ok: true,
+    candidateId,
+    params: selected.params,
+    applied,
+    safeMode: getSafeModeState(),
+    scheduler: scheduler.getState()
+  };
 }
 
 async function getJournalReport() {
@@ -1732,6 +1920,54 @@ function humanDuration(ms: number) {
   const h = Math.floor(sec / 3600);
   const m = Math.floor((sec % 3600) / 60);
   return `${h}h ${m}m`;
+}
+
+function parseJsonArray(value?: string) {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map((x) => String(x));
+  } catch {
+    return [];
+  }
+}
+
+function parseCandidateParams(value: string) {
+  try {
+    const parsed = JSON.parse(value) as Partial<{
+      minRsi: number;
+      breakoutBufferPct: number;
+      atrStopMultiple: number;
+      riskPerTrade: number;
+      minVolumeRatio: number;
+      maxSignals: number;
+    }>;
+    return {
+      minRsi: Number(parsed.minRsi ?? 55),
+      breakoutBufferPct: Number(parsed.breakoutBufferPct ?? 0.02),
+      atrStopMultiple: Number(parsed.atrStopMultiple ?? 2),
+      riskPerTrade: Number(parsed.riskPerTrade ?? 0.015),
+      minVolumeRatio: Number(parsed.minVolumeRatio ?? 1.2),
+      maxSignals: Number(parsed.maxSignals ?? 5)
+    };
+  } catch {
+    return {
+      minRsi: 55,
+      breakoutBufferPct: 0.02,
+      atrStopMultiple: 2,
+      riskPerTrade: 0.015,
+      minVolumeRatio: 1.2,
+      maxSignals: 5
+    };
+  }
+}
+
+function roundToStr(value: number, decimals: number) {
+  const n = Number(value ?? 0);
+  const p = 10 ** decimals;
+  const rounded = Math.round(n * p) / p;
+  return rounded.toFixed(decimals).replace(/\.?0+$/, "");
 }
 
 function diagnoseBrokerOrder(reasonRaw: string, status: string) {

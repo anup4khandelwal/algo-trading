@@ -163,6 +163,24 @@ Live closed-lot metrics:
 Latest backtest baseline and symbol metrics.
 Use as benchmark, not guarantee.
 
+## Strategy Lab
+Runs controlled parameter sweeps on your historical data window and ranks candidates by:
+- robustness score,
+- stability score,
+- guardrail pass/fail.
+
+Workflow:
+1. Click **Strategy Lab** in the action bar.
+2. Wait for run completion.
+3. Review top candidates and recommendation.
+4. Click `Apply Cxx` only after review.
+
+Apply behavior:
+- updates strategy keys in `.env`,
+- enables Safe Mode,
+- stops scheduler.
+Resume trading only after explicit verification.
+
 ## Live vs Backtest Drift
 Compares live behavior to backtest baseline.
 Alert count > 0 means behavior divergence requires attention.
@@ -214,7 +232,8 @@ Always keep:
 - premarket,
 - monitor interval,
 - eod,
-- weekly backtest slot.
+- weekly backtest slot,
+- weekly Strategy Lab slot.
 
 2. Token expiry alerts
 - configurable by `TOKEN_EXPIRY_ALERT_MINUTES`.
