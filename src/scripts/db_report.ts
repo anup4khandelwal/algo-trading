@@ -117,6 +117,21 @@ async function main() {
           )
         : { rowCount: 0, rows: [] as any[] };
 
+    const journalTable = await pool.query<{ exists: string | null }>(
+      `SELECT to_regclass('public.trade_journal') AS exists`
+    );
+    const journal =
+      journalTable.rows[0]?.exists
+        ? await pool.query(
+            `
+            SELECT lot_id, symbol, setup_tag, confidence, mistake_tag, updated_at
+            FROM trade_journal
+            ORDER BY updated_at DESC
+            LIMIT 20
+            `
+          )
+        : { rowCount: 0, rows: [] as any[] };
+
     console.log("=== DB REPORT ===");
     console.log(`orders(last10): ${orders.rowCount ?? 0}`);
     for (const row of orders.rows) {
@@ -176,6 +191,13 @@ async function main() {
     for (const row of backtests.rows) {
       console.log(
         `  ${row.created_at.toISOString()} | ${row.run_id} | ${formatDate(row.from_date)}->${formatDate(row.to_date)} | trades=${row.trades} | pnl=${row.total_pnl} | dd=${row.max_drawdown_abs} | cagr=${row.cagr_pct}% | symbols=${row.symbols_csv}`
+      );
+    }
+
+    console.log(`trade_journal(last20): ${journal.rowCount ?? 0}`);
+    for (const row of journal.rows) {
+      console.log(
+        `  ${row.updated_at.toISOString()} | lot=${row.lot_id} | ${row.symbol} | setup=${row.setup_tag} | conf=${row.confidence} | mistake=${row.mistake_tag ?? ""}`
       );
     }
   } catch (err) {

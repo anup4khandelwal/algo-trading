@@ -6,7 +6,8 @@ import {
   ClosedTradeLot,
   DailySnapshot,
   ManagedPositionRecord,
-  Persistence
+  Persistence,
+  TradeJournalEntry
 } from "./persistence.js";
 import { ReconcileAudit } from "./persistence.js";
 
@@ -124,6 +125,19 @@ export class PostgresPersistence implements Persistence {
         sharpe_proxy DOUBLE PRECISION NOT NULL,
         meta_json TEXT,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS trade_journal (
+        id BIGSERIAL PRIMARY KEY,
+        lot_id BIGINT NOT NULL UNIQUE,
+        symbol TEXT NOT NULL,
+        setup_tag TEXT NOT NULL,
+        confidence INTEGER NOT NULL,
+        mistake_tag TEXT,
+        notes TEXT,
+        screenshot_url TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
     `);
   }
@@ -560,6 +574,62 @@ export class PostgresPersistence implements Persistence {
       metaJson: row.meta_json ?? undefined,
       createdAt: new Date(row.created_at).toISOString()
     };
+  }
+
+  async upsertTradeJournalEntry(
+    entry: Omit<TradeJournalEntry, "id" | "createdAt" | "updatedAt">
+  ): Promise<void> {
+    await this.pool.query(
+      `
+      INSERT INTO trade_journal (
+        lot_id, symbol, setup_tag, confidence, mistake_tag, notes, screenshot_url, created_at, updated_at
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,NOW(),NOW())
+      ON CONFLICT (lot_id)
+      DO UPDATE SET
+        symbol = EXCLUDED.symbol,
+        setup_tag = EXCLUDED.setup_tag,
+        confidence = EXCLUDED.confidence,
+        mistake_tag = EXCLUDED.mistake_tag,
+        notes = EXCLUDED.notes,
+        screenshot_url = EXCLUDED.screenshot_url,
+        updated_at = NOW()
+      `,
+      [
+        entry.lotId,
+        entry.symbol,
+        entry.setupTag,
+        entry.confidence,
+        entry.mistakeTag ?? null,
+        entry.notes ?? null,
+        entry.screenshotUrl ?? null
+      ]
+    );
+  }
+
+  async loadTradeJournalEntries(limit: number): Promise<TradeJournalEntry[]> {
+    const { rows } = await this.pool.query(
+      `
+      SELECT
+        id, lot_id, symbol, setup_tag, confidence, mistake_tag, notes, screenshot_url, created_at, updated_at
+      FROM trade_journal
+      ORDER BY updated_at DESC
+      LIMIT $1
+      `,
+      [limit]
+    );
+    return rows.map((row) => ({
+      id: Number(row.id),
+      lotId: Number(row.lot_id),
+      symbol: row.symbol,
+      setupTag: row.setup_tag,
+      confidence: Number(row.confidence),
+      mistakeTag: row.mistake_tag ?? undefined,
+      notes: row.notes ?? undefined,
+      screenshotUrl: row.screenshot_url ?? undefined,
+      createdAt: new Date(row.created_at).toISOString(),
+      updatedAt: new Date(row.updated_at).toISOString()
+    }));
   }
 }
 

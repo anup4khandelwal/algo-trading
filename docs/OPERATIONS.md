@@ -45,11 +45,13 @@ Run analytics and export:
 ```bash
 npm run weekly
 npm run backtest
+npm run journal:export
 ```
 This executes:
 - `strategy:report`
 - `strategy:rebalance`
 - `trades:export`
+- `journal:export`
 
 Review `.env.recommended` and selectively apply updates.
 
@@ -74,4 +76,5 @@ npm run reconcile
 - Reports: `npm run db:report`
 - Strategy health: `npm run strategy:report`
 - Backtest health: `npm run backtest`
+- Journal export: `npm run journal:export`
 - Broker token errors: regenerate via `npm run auth`

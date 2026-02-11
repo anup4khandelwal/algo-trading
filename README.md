@@ -80,6 +80,7 @@ npm run ui
 - `npm run strategy:report`: win rate, avg R, drawdown, symbol stats
 - `npm run strategy:rebalance`: writes `.env.recommended`
 - `npm run backtest`: historical replay backtest + metrics + JSON export + DB snapshot
+- `npm run journal:export`: exports joined closed-trade + journal tags CSV
 - `npm run weekly`: report + rebalance + CSV export
 
 ## Live Trading Safety
@@ -108,6 +109,19 @@ Results:
 - latest run persisted in `backtest_runs` table
 - JSON export at `exports/backtest-latest.json` (configurable via `BACKTEST_EXPORT_PATH`)
 - UI shows latest backtest in **Backtest Analytics**.
+
+## Trade Journal
+- UI section **Trade Journal** lets you tag closed lots with:
+  - `setupTag`, `confidence (1-5)`, `mistakeTag`, notes, screenshot URL
+- Analytics shown in UI:
+  - expectancy by setup
+  - win rate by weekday
+  - average hold days
+  - top mistakes
+- Export with:
+```bash
+npm run journal:export
+```
 
 ## Recommended Daily Runbook
 1. Refresh token (`npm run auth`) before market open.

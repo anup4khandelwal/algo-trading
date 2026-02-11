@@ -50,6 +50,12 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (method === "GET" && url.pathname === "/api/journal") {
+      const journal = await getJournalReport();
+      json(res, 200, journal);
+      return;
+    }
+
     if (method === "POST" && url.pathname === "/api/run/morning") {
       if (runningJob) {
         json(res, 409, { error: `Job already running: ${runningJob}` });
@@ -110,6 +116,43 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (method === "POST" && url.pathname === "/api/journal") {
+      const body = await readJsonBody(req);
+      const lotId = Number(body?.lotId);
+      const symbol = String(body?.symbol ?? "").toUpperCase();
+      const setupTag = String(body?.setupTag ?? "").trim();
+      const confidence = Number(body?.confidence ?? 0);
+      const mistakeTag = String(body?.mistakeTag ?? "").trim();
+      const notes = String(body?.notes ?? "").trim();
+      const screenshotUrl = String(body?.screenshotUrl ?? "").trim();
+      if (!Number.isFinite(lotId) || lotId <= 0 || !symbol || !setupTag) {
+        json(res, 400, { error: "lotId, symbol, setupTag are required" });
+        return;
+      }
+      if (!Number.isFinite(confidence) || confidence < 1 || confidence > 5) {
+        json(res, 400, { error: "confidence must be between 1 and 5" });
+        return;
+      }
+      const databaseUrl = process.env.DATABASE_URL;
+      if (!databaseUrl) {
+        json(res, 400, { error: "DATABASE_URL is not set" });
+        return;
+      }
+      const persistence = new PostgresPersistence(databaseUrl);
+      await persistence.init();
+      await persistence.upsertTradeJournalEntry({
+        lotId,
+        symbol,
+        setupTag,
+        confidence,
+        mistakeTag: mistakeTag || undefined,
+        notes: notes || undefined,
+        screenshotUrl: screenshotUrl || undefined
+      });
+      json(res, 200, { ok: true });
+      return;
+    }
+
     json(res, 404, { error: "Not found" });
   } catch (err) {
     console.error(err);
@@ -124,6 +167,18 @@ server.listen(PORT, "127.0.0.1", () => {
 function json(res: http.ServerResponse, status: number, body: unknown) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(body));
+}
+
+async function readJsonBody(req: http.IncomingMessage): Promise<any> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  const raw = Buffer.concat(chunks).toString("utf-8").trim();
+  if (!raw) {
+    return {};
+  }
+  return JSON.parse(raw);
 }
 
 async function getDbReport() {
@@ -350,6 +405,27 @@ async function getBacktestReport() {
   }
 }
 
+async function getJournalReport() {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) {
+    return { enabled: false, entries: [], closedLots: [], analytics: emptyJournalAnalytics() };
+  }
+  const persistence = new PostgresPersistence(databaseUrl);
+  try {
+    await persistence.init();
+    const lookback = Number(process.env.STRATEGY_REPORT_LOOKBACK ?? "200");
+    const [entries, closedLots] = await Promise.all([
+      persistence.loadTradeJournalEntries(200),
+      persistence.loadClosedTradeLots(lookback)
+    ]);
+    const analytics = journalAnalytics(entries, closedLots);
+    return { enabled: true, entries, closedLots, analytics };
+  } catch (err) {
+    maybeLogDbError(err);
+    return { enabled: false, entries: [], closedLots: [], analytics: emptyJournalAnalytics() };
+  }
+}
+
 function summarizeBySymbol(rows: { symbol: string; pnl: number; rMultiple: number }[]) {
   const map = new Map<
     string,
@@ -409,6 +485,100 @@ function maybeLogDbError(err: unknown) {
     console.error("UI_DB_ERROR", err);
     lastDbErrorLogAt = now;
   }
+}
+
+function emptyJournalAnalytics() {
+  return {
+    bySetup: [] as Array<{ setupTag: string; trades: number; winRate: number; expectancy: number }>,
+    byWeekday: [] as Array<{ weekday: string; trades: number; winRate: number }>,
+    avgHoldDays: 0,
+    topMistakes: [] as Array<{ mistakeTag: string; count: number }>
+  };
+}
+
+function journalAnalytics(
+  entries: Array<{
+    lotId: number;
+    setupTag: string;
+    mistakeTag?: string;
+  }>,
+  closedLots: Array<{
+    id: number;
+    entryPrice: number;
+    exitPrice: number;
+    qty: number;
+    openedAt: string;
+    closedAt: string;
+  }>
+) {
+  const lotMap = new Map(closedLots.map((lot) => [lot.id, lot]));
+
+  const setupMap = new Map<string, { trades: number; wins: number; pnl: number }>();
+  const weekdayMap = new Map<string, { trades: number; wins: number }>();
+  const mistakeMap = new Map<string, number>();
+  let holdDaysSum = 0;
+  let holdDaysCount = 0;
+
+  for (const entry of entries) {
+    const lot = lotMap.get(entry.lotId);
+    if (!lot) {
+      continue;
+    }
+    const pnl = (lot.exitPrice - lot.entryPrice) * lot.qty;
+    const win = pnl > 0 ? 1 : 0;
+    const setup = setupMap.get(entry.setupTag) ?? { trades: 0, wins: 0, pnl: 0 };
+    setup.trades += 1;
+    setup.wins += win;
+    setup.pnl += pnl;
+    setupMap.set(entry.setupTag, setup);
+
+    const weekday = new Date(lot.closedAt).toLocaleDateString("en-US", {
+      weekday: "short",
+      timeZone: "Asia/Kolkata"
+    });
+    const day = weekdayMap.get(weekday) ?? { trades: 0, wins: 0 };
+    day.trades += 1;
+    day.wins += win;
+    weekdayMap.set(weekday, day);
+
+    const holdDays = Math.max(
+      1,
+      Math.round(
+        (new Date(lot.closedAt).getTime() - new Date(lot.openedAt).getTime()) /
+          (24 * 3600 * 1000)
+      )
+    );
+    holdDaysSum += holdDays;
+    holdDaysCount += 1;
+
+    if (entry.mistakeTag && entry.mistakeTag.trim().length > 0) {
+      const key = entry.mistakeTag.trim();
+      mistakeMap.set(key, (mistakeMap.get(key) ?? 0) + 1);
+    }
+  }
+
+  return {
+    bySetup: Array.from(setupMap.entries())
+      .map(([setupTag, x]) => ({
+        setupTag,
+        trades: x.trades,
+        winRate: x.trades === 0 ? 0 : x.wins / x.trades,
+        expectancy: x.trades === 0 ? 0 : x.pnl / x.trades
+      }))
+      .sort((a, b) => b.expectancy - a.expectancy),
+    byWeekday: Array.from(weekdayMap.entries())
+      .map(([weekday, x]) => ({
+        weekday,
+        trades: x.trades,
+        winRate: x.trades === 0 ? 0 : x.wins / x.trades
+      }))
+      .sort((a, b) => b.trades - a.trades),
+    avgHoldDays: holdDaysCount === 0 ? 0 : holdDaysSum / holdDaysCount,
+    topMistakes: Array.from(mistakeMap.entries())
+      .map(([mistakeTag, count]) => ({ mistakeTag, count }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 8)
+  };
 }
 
 function htmlPage() {
@@ -625,6 +795,22 @@ function htmlPage() {
         <div id="backtestBySymbol" style="margin-top:8px;"></div>
       </section>
       <section class="card wide">
+        <h2>Trade Journal</h2>
+        <div class="meta">Tag closed trades with setup quality and mistakes.</div>
+        <div style="display:grid; grid-template-columns: repeat(6,minmax(0,1fr)); gap:8px; margin-top:10px;">
+          <select id="journalLot" style="padding:8px; border-radius:8px; border:1px solid var(--line);"></select>
+          <input id="journalSetup" placeholder="setup tag" style="padding:8px; border-radius:8px; border:1px solid var(--line);" />
+          <input id="journalConfidence" type="number" min="1" max="5" value="3" placeholder="confidence 1-5" style="padding:8px; border-radius:8px; border:1px solid var(--line);" />
+          <input id="journalMistake" placeholder="mistake tag" style="padding:8px; border-radius:8px; border:1px solid var(--line);" />
+          <input id="journalScreenshot" placeholder="screenshot url" style="padding:8px; border-radius:8px; border:1px solid var(--line);" />
+          <button id="journalSaveBtn" class="btn-main">Save Entry</button>
+        </div>
+        <textarea id="journalNotes" rows="2" placeholder="notes" style="width:100%; margin-top:8px; padding:8px; border-radius:8px; border:1px solid var(--line);"></textarea>
+        <div id="journalStatus" class="meta" style="margin-top:8px;"></div>
+        <div id="journalAnalytics" style="margin-top:8px;"></div>
+        <div id="journalEntries" style="margin-top:8px;"></div>
+      </section>
+      <section class="card wide">
         <h2>Ops Events</h2>
         <div id="opsEvents"></div>
       </section>
@@ -646,6 +832,16 @@ function htmlPage() {
     const strategyBySymbol = document.getElementById("strategyBySymbol");
     const backtestSummary = document.getElementById("backtestSummary");
     const backtestBySymbol = document.getElementById("backtestBySymbol");
+    const journalLot = document.getElementById("journalLot");
+    const journalSetup = document.getElementById("journalSetup");
+    const journalConfidence = document.getElementById("journalConfidence");
+    const journalMistake = document.getElementById("journalMistake");
+    const journalScreenshot = document.getElementById("journalScreenshot");
+    const journalNotes = document.getElementById("journalNotes");
+    const journalSaveBtn = document.getElementById("journalSaveBtn");
+    const journalStatus = document.getElementById("journalStatus");
+    const journalAnalytics = document.getElementById("journalAnalytics");
+    const journalEntries = document.getElementById("journalEntries");
     const opsEvents = document.getElementById("opsEvents");
 
     morningBtn.onclick = () => trigger("/api/run/morning");
@@ -653,6 +849,7 @@ function htmlPage() {
     preflightBtn.onclick = () => trigger("/api/run/preflight");
     backtestBtn.onclick = () => trigger("/api/run/backtest");
     refreshBtn.onclick = () => load();
+    journalSaveBtn.onclick = () => saveJournalEntry();
 
     async function trigger(path) {
       const res = await fetch(path, { method: "POST" });
@@ -662,16 +859,18 @@ function htmlPage() {
     }
 
     async function load() {
-      const [statusRes, reportRes, strategyRes, backtestRes] = await Promise.all([
+      const [statusRes, reportRes, strategyRes, backtestRes, journalRes] = await Promise.all([
         fetch("/api/status"),
         fetch("/api/report"),
         fetch("/api/strategy"),
-        fetch("/api/backtest")
+        fetch("/api/backtest"),
+        fetch("/api/journal")
       ]);
       const status = await statusRes.json();
       const report = await reportRes.json();
       const strategy = await strategyRes.json();
       const backtest = await backtestRes.json();
+      const journal = await journalRes.json();
 
       if (status.runningJob) {
         statusEl.innerHTML = '<span class="dot"></span>Running ' + status.runningJob;
@@ -702,7 +901,38 @@ function htmlPage() {
       render("fills", report.fills, ["order_id", "symbol", "side", "qty", "price", "fill_time"]);
       renderStrategy(strategy);
       renderBacktest(backtest);
+      renderJournal(journal);
       renderOps(report);
+    }
+
+    async function saveJournalEntry() {
+      const selected = String(journalLot.value || "");
+      if (!selected) {
+        journalStatus.textContent = "Select a closed lot.";
+        return;
+      }
+      const [lotId, symbol] = selected.split("|");
+      const payload = {
+        lotId: Number(lotId),
+        symbol: symbol || "",
+        setupTag: String(journalSetup.value || "").trim(),
+        confidence: Number(journalConfidence.value || 0),
+        mistakeTag: String(journalMistake.value || "").trim(),
+        notes: String(journalNotes.value || "").trim(),
+        screenshotUrl: String(journalScreenshot.value || "").trim()
+      };
+      const res = await fetch("/api/journal", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const body = await res.json();
+      if (!res.ok) {
+        journalStatus.textContent = body.error || "Failed to save journal entry";
+        return;
+      }
+      journalStatus.textContent = "Journal saved.";
+      await load();
     }
 
     function render(id, rows, columns) {
@@ -799,6 +1029,56 @@ function htmlPage() {
         '<tr><td class="mono">' + r.symbol + '</td><td>' + r.trades + '</td><td>' + pct(r.winRate) + '</td><td>' + Number(r.avgR).toFixed(3) + '</td><td>' + inr(r.pnl) + '</td></tr>'
       ).join('');
       backtestBySymbol.innerHTML = '<table>' + head + body + '</table>';
+    }
+
+    function renderJournal(journal) {
+      if (!journal || !journal.enabled) {
+        journalStatus.textContent = "Journal unavailable (DB not configured).";
+        journalLot.innerHTML = '<option value="">No closed lots</option>';
+        journalAnalytics.innerHTML = '<div class="empty">No analytics</div>';
+        journalEntries.innerHTML = '<div class="empty">No entries</div>';
+        return;
+      }
+      const lots = journal.closedLots || [];
+      journalLot.innerHTML = '<option value="">Select closed lot</option>' + lots.slice(0, 80).map(l =>
+        '<option value="' + l.id + '|' + l.symbol + '">' +
+          '#' + l.id + ' ' + l.symbol + ' (' + new Date(l.closedAt).toLocaleDateString('en-IN') + ')' +
+        '</option>'
+      ).join('');
+
+      const a = journal.analytics || {};
+      const bySetup = (a.bySetup || []).slice(0, 10);
+      const byWeekday = (a.byWeekday || []).slice(0, 7);
+      const mistakes = (a.topMistakes || []).slice(0, 8);
+      const setupTable = bySetup.length === 0
+        ? '<div class="empty">No setup analytics</div>'
+        : '<table><tr><th>setup</th><th>trades</th><th>winRate</th><th>expectancy</th></tr>' +
+          bySetup.map(r => '<tr><td>' + r.setupTag + '</td><td>' + r.trades + '</td><td>' + pct(r.winRate) + '</td><td>' + inr(r.expectancy) + '</td></tr>').join('') +
+          '</table>';
+      const weekdayTable = byWeekday.length === 0
+        ? ''
+        : '<table style="margin-top:8px;"><tr><th>weekday</th><th>trades</th><th>winRate</th></tr>' +
+          byWeekday.map(r => '<tr><td>' + r.weekday + '</td><td>' + r.trades + '</td><td>' + pct(r.winRate) + '</td></tr>').join('') +
+          '</table>';
+      const mistakesTable = mistakes.length === 0
+        ? ''
+        : '<table style="margin-top:8px;"><tr><th>mistake</th><th>count</th></tr>' +
+          mistakes.map(r => '<tr><td>' + r.mistakeTag + '</td><td>' + r.count + '</td></tr>').join('') +
+          '</table>';
+      journalAnalytics.innerHTML =
+        '<div class="meta">Avg Hold Days: ' + Number(a.avgHoldDays || 0).toFixed(2) + '</div>' +
+        setupTable + weekdayTable + mistakesTable;
+
+      const rows = journal.entries || [];
+      if (rows.length === 0) {
+        journalEntries.innerHTML = '<div class="empty">No journal entries yet</div>';
+      } else {
+        const head = '<tr><th>lot</th><th>symbol</th><th>setup</th><th>conf</th><th>mistake</th><th>updated</th></tr>';
+        const body = rows.map(r =>
+          '<tr><td class="mono">' + r.lotId + '</td><td class="mono">' + r.symbol + '</td><td>' + r.setupTag + '</td><td>' + r.confidence + '</td><td>' + (r.mistakeTag || '') + '</td><td>' + new Date(r.updatedAt).toLocaleString('en-IN') + '</td></tr>'
+        ).join('');
+        journalEntries.innerHTML = '<table>' + head + body + '</table>';
+      }
     }
 
     function pct(v) {

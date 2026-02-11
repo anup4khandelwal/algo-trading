@@ -58,6 +58,12 @@ npm run backtest
 ```
 Latest result is exported to `exports/backtest-latest.json` and shown in UI.
 
+## 9) Optional trade journal export
+```bash
+npm run journal:export
+```
+Exports to `exports/trade-journal.csv`.
+
 ## Safety before live mode
 Set:
 ```env

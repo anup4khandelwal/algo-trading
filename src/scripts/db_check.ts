@@ -13,7 +13,8 @@ const REQUIRED_TABLES = [
   "system_state",
   "alert_events",
   "reconcile_audit",
-  "backtest_runs"
+  "backtest_runs",
+  "trade_journal"
 ];
 
 async function main() {

@@ -67,6 +67,19 @@ export interface BacktestRunRecord {
   createdAt: string;
 }
 
+export interface TradeJournalEntry {
+  id: number;
+  lotId: number;
+  symbol: string;
+  setupTag: string;
+  confidence: number;
+  mistakeTag?: string;
+  notes?: string;
+  screenshotUrl?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface Persistence {
   init(): Promise<void>;
   upsertOrder(order: Order): Promise<void>;
@@ -101,6 +114,10 @@ export interface Persistence {
   loadLatestReconcileAudits(limit: number): Promise<ReconcileAudit[]>;
   insertBacktestRun(run: Omit<BacktestRunRecord, "id" | "createdAt">): Promise<void>;
   loadLatestBacktestRun(): Promise<BacktestRunRecord | null>;
+  upsertTradeJournalEntry(
+    entry: Omit<TradeJournalEntry, "id" | "createdAt" | "updatedAt">
+  ): Promise<void>;
+  loadTradeJournalEntries(limit: number): Promise<TradeJournalEntry[]>;
 }
 
 export class NoopPersistence implements Persistence {
@@ -154,5 +171,11 @@ export class NoopPersistence implements Persistence {
   async insertBacktestRun(_run: Omit<BacktestRunRecord, "id" | "createdAt">): Promise<void> {}
   async loadLatestBacktestRun(): Promise<BacktestRunRecord | null> {
     return null;
+  }
+  async upsertTradeJournalEntry(
+    _entry: Omit<TradeJournalEntry, "id" | "createdAt" | "updatedAt">
+  ): Promise<void> {}
+  async loadTradeJournalEntries(_limit: number): Promise<TradeJournalEntry[]> {
+    return [];
   }
 }

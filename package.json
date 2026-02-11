@@ -18,11 +18,12 @@
     "reconcile": "npm run build && node dist/scripts/reconcile.js",
     "eod:close": "npm run build && node dist/scripts/eod_close.js",
     "trades:export": "npm run build && node dist/scripts/export_trades_csv.js",
+    "journal:export": "npm run build && node dist/scripts/journal_export.js",
     "strategy:report": "npm run build && node dist/scripts/strategy_report.js",
     "strategy:rebalance": "npm run build && node dist/scripts/strategy_rebalance.js",
     "backtest": "npm run build && node dist/scripts/backtest.js",
     "morning": "npm run db:check && npm run reconcile && npm run demo && npm run db:report",
-    "weekly": "npm run strategy:report && npm run strategy:rebalance && npm run trades:export",
+    "weekly": "npm run strategy:report && npm run strategy:rebalance && npm run trades:export && npm run journal:export",
     "auth": "npm run build && node dist/auth/server.js",
     "start": "node dist/index.js"
   },
