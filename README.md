@@ -89,6 +89,8 @@ Use these env controls before enabling live orders:
 - `CONFIRM_LIVE_ORDERS=YES`
 - `ALLOWED_SYMBOLS=...`
 - `MAX_NOTIONAL_PER_ORDER=...`
+- `KITE_ORDER_VARIETY=regular|amo`
+- `KITE_ENABLE_AMO_FALLBACK=1` (auto-retry AMO if broker returns `switch_to_amo`)
 - `HALT_TRADING=1` to pause entries immediately
 - Optional Telegram alerts:
   - `TELEGRAM_BOT_TOKEN`
@@ -148,7 +150,17 @@ Token countdown notes:
 - `npm run auth` now updates both `KITE_ACCESS_TOKEN` and `KITE_ACCESS_TOKEN_CREATED_AT`
 - expiry shown is an estimate using IST reset window:
   - `KITE_TOKEN_RESET_HOUR_IST` (default `6`)
-  - `KITE_TOKEN_RESET_MINUTE_IST` (default `0`)
+- `KITE_TOKEN_RESET_MINUTE_IST` (default `0`)
+
+## Live vs Backtest Drift
+UI includes a **Live vs Backtest Drift** panel:
+- compares live closed-trade performance to latest backtest baseline
+- shows drift in `win rate`, `avg R`, and `expectancy`
+- symbol-level drift table with alert flags
+
+Thresholds:
+- `DRIFT_WINRATE_ALERT_PCT` (default `12`)
+- `DRIFT_AVGR_ALERT` (default `0.5`)
 
 ## Recommended Daily Runbook
 1. Refresh token (`npm run auth`) before market open.

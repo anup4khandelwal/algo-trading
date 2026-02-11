@@ -13,6 +13,7 @@ export class ZerodhaAdapter {
       baseUrl?: string;
       product?: string;
       exchange?: string;
+      orderVariety?: "regular" | "amo";
     } = { mode: "paper" }
   ) {}
 
@@ -172,7 +173,8 @@ export class ZerodhaAdapter {
   private async placeLiveOrder(order: Order): Promise<Fill> {
     const { apiKey, accessToken } = this.credentials();
     const baseUrl = this.cfg.baseUrl ?? "https://api.kite.trade";
-    const variety = "regular";
+    const configuredVariety = this.cfg.orderVariety ?? "regular";
+    const allowAmoFallback = process.env.KITE_ENABLE_AMO_FALLBACK === "1";
     const exchange = this.cfg.exchange ?? "NSE";
     const product = this.cfg.product ?? "CNC";
 
@@ -189,23 +191,40 @@ export class ZerodhaAdapter {
       form.set("price", String(order.intent.price));
     }
 
-    const placeRes = await fetch(`${baseUrl}/orders/${variety}`, {
-      method: "POST",
-      headers: {
-        "X-Kite-Version": "3",
-        Authorization: `token ${apiKey}:${accessToken}`
-      },
-      body: form
-    });
-    if (!placeRes.ok) {
-      const body = await placeRes.text();
-      throw new Error(`Live place order failed ${placeRes.status}: ${body}`);
+    const initialAttempt = await placeOrderWithVariety(
+      baseUrl,
+      configuredVariety,
+      apiKey,
+      accessToken,
+      form
+    );
+    let placed = initialAttempt.placed;
+    if (!initialAttempt.ok) {
+      const amoHint = extractAmoHint(initialAttempt.body);
+      if (amoHint && configuredVariety !== "amo" && allowAmoFallback) {
+        const amoAttempt = await placeOrderWithVariety(
+          baseUrl,
+          "amo",
+          apiKey,
+          accessToken,
+          form
+        );
+        if (!amoAttempt.ok) {
+          throw new Error(
+            `Live place order failed ${amoAttempt.status}: ${amoAttempt.body} (AMO retry attempted)`
+          );
+        }
+        placed = amoAttempt.placed;
+      } else {
+        const hintText = amoHint
+          ? " Hint: broker suggests AMO. Set KITE_ENABLE_AMO_FALLBACK=1 or KITE_ORDER_VARIETY=amo."
+          : "";
+        throw new Error(
+          `Live place order failed ${initialAttempt.status}: ${initialAttempt.body}${hintText}`
+        );
+      }
     }
-    const placed = (await placeRes.json()) as {
-      status: string;
-      data?: { order_id: string };
-      message?: string;
-    };
+
     const brokerOrderId = placed.data?.order_id;
     if (!brokerOrderId) {
       throw new Error(`Live place order missing order_id: ${placed.message ?? "unknown"}`);
@@ -277,6 +296,65 @@ export class ZerodhaAdapter {
     }
     return { apiKey, accessToken };
   }
+}
+
+function extractAmoHint(body: string): boolean {
+  try {
+    const parsed = JSON.parse(body) as { data?: { hints?: string[] } };
+    return Array.isArray(parsed.data?.hints) && parsed.data!.hints!.includes("switch_to_amo");
+  } catch {
+    return body.includes("switch_to_amo");
+  }
+}
+
+async function placeOrderWithVariety(
+  baseUrl: string,
+  variety: "regular" | "amo",
+  apiKey: string,
+  accessToken: string,
+  form: URLSearchParams
+): Promise<{
+  ok: boolean;
+  status: number;
+  body: string;
+  placed: {
+    status: string;
+    data?: { order_id: string };
+    message?: string;
+  };
+}> {
+  const res = await fetch(`${baseUrl}/orders/${variety}`, {
+    method: "POST",
+    headers: {
+      "X-Kite-Version": "3",
+      Authorization: `token ${apiKey}:${accessToken}`
+    },
+    body: form
+  });
+  const body = await res.text();
+  if (!res.ok) {
+    return {
+      ok: false,
+      status: res.status,
+      body,
+      placed: { status: "error", message: body }
+    };
+  }
+  let placed: {
+    status: string;
+    data?: { order_id: string };
+    message?: string;
+  } = { status: "error", message: "empty response" };
+  try {
+    placed = JSON.parse(body) as {
+      status: string;
+      data?: { order_id: string };
+      message?: string;
+    };
+  } catch {
+    placed = { status: "error", message: body };
+  }
+  return { ok: true, status: res.status, body, placed };
 }
 
 function sleep(ms: number): Promise<void> {

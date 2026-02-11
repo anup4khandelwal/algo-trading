@@ -95,6 +95,12 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (method === "GET" && url.pathname === "/api/drift") {
+      const drift = await getDriftReport();
+      json(res, 200, drift);
+      return;
+    }
+
     if (method === "GET" && url.pathname === "/api/journal") {
       const journal = await getJournalReport();
       json(res, 200, journal);
@@ -214,7 +220,9 @@ function launchJob(
     json(res, 409, { error: `Job already running: ${runningJob}` });
     return false;
   }
-  void runUiJob(job, logTag, runner);
+  void runUiJob(job, logTag, runner).catch(() => {
+    // Swallow here: runUiJob already logs and stores runtime error.
+  });
   json(res, 202, { accepted: true, job });
   return true;
 }
@@ -489,6 +497,153 @@ async function getJournalReport() {
   } catch (err) {
     maybeLogDbError(err);
     return { enabled: false, entries: [], closedLots: [], analytics: emptyJournalAnalytics() };
+  }
+}
+
+async function getDriftReport() {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) {
+    return { enabled: false, summary: null, rows: [], message: "DATABASE_URL is not set" };
+  }
+  const persistence = new PostgresPersistence(databaseUrl);
+  const lookback = Number(process.env.STRATEGY_REPORT_LOOKBACK ?? "200");
+  const winRateAlertPct = Number(process.env.DRIFT_WINRATE_ALERT_PCT ?? "12");
+  const avgRAlert = Number(process.env.DRIFT_AVGR_ALERT ?? "0.5");
+  try {
+    await persistence.init();
+    const [lots, latestBacktest] = await Promise.all([
+      persistence.loadClosedTradeLots(lookback),
+      persistence.loadLatestBacktestRun()
+    ]);
+    if (!latestBacktest) {
+      return {
+        enabled: true,
+        summary: null,
+        rows: [],
+        message: "No backtest baseline found. Run backtest first."
+      };
+    }
+
+    let backtestBySymbol: Array<{
+      symbol: string;
+      trades: number;
+      winRate: number;
+      pnl: number;
+      avgR: number;
+    }> = [];
+    try {
+      const meta = latestBacktest.metaJson ? JSON.parse(latestBacktest.metaJson) : null;
+      backtestBySymbol = Array.isArray(meta?.bySymbol) ? meta.bySymbol : [];
+    } catch {
+      backtestBySymbol = [];
+    }
+
+    const liveRows = lots.map((lot) => {
+      const pnl = (lot.exitPrice - lot.entryPrice) * lot.qty;
+      const riskPerShare = Math.max(lot.entryPrice - lot.stopPrice, 0.01);
+      const rMultiple = (lot.exitPrice - lot.entryPrice) / riskPerShare;
+      return { symbol: lot.symbol, pnl, rMultiple };
+    });
+    const liveBySymbol = summarizeBySymbol(liveRows).map((x) => ({
+      symbol: x.symbol,
+      trades: x.trades,
+      winRate: x.winRate,
+      avgR: x.avgR,
+      pnl: x.pnl,
+      expectancy: x.trades > 0 ? x.pnl / x.trades : 0
+    }));
+    const btBySymbolMap = new Map(
+      backtestBySymbol.map((x) => [
+        x.symbol,
+        {
+          symbol: x.symbol,
+          trades: Number(x.trades ?? 0),
+          winRate: Number(x.winRate ?? 0),
+          avgR: Number(x.avgR ?? 0),
+          pnl: Number(x.pnl ?? 0),
+          expectancy: Number(x.trades ?? 0) > 0 ? Number(x.pnl ?? 0) / Number(x.trades ?? 1) : 0
+        }
+      ])
+    );
+    const liveBySymbolMap = new Map(liveBySymbol.map((x) => [x.symbol, x]));
+    const symbols = Array.from(new Set([...liveBySymbolMap.keys(), ...btBySymbolMap.keys()]));
+    const rows = symbols
+      .map((symbol) => {
+        const live = liveBySymbolMap.get(symbol) ?? {
+          symbol,
+          trades: 0,
+          winRate: 0,
+          avgR: 0,
+          pnl: 0,
+          expectancy: 0
+        };
+        const bt = btBySymbolMap.get(symbol) ?? {
+          symbol,
+          trades: 0,
+          winRate: 0,
+          avgR: 0,
+          pnl: 0,
+          expectancy: 0
+        };
+        const deltaWinRate = live.winRate - bt.winRate;
+        const deltaAvgR = live.avgR - bt.avgR;
+        const deltaExpectancy = live.expectancy - bt.expectancy;
+        const alert =
+          Math.abs(deltaWinRate * 100) >= winRateAlertPct || Math.abs(deltaAvgR) >= avgRAlert;
+        const driftScore = Math.abs(deltaWinRate) + Math.abs(deltaAvgR) * 0.2;
+        return {
+          symbol,
+          liveTrades: live.trades,
+          btTrades: bt.trades,
+          liveWinRate: live.winRate,
+          btWinRate: bt.winRate,
+          deltaWinRate,
+          liveAvgR: live.avgR,
+          btAvgR: bt.avgR,
+          deltaAvgR,
+          liveExpectancy: live.expectancy,
+          btExpectancy: bt.expectancy,
+          deltaExpectancy,
+          driftScore,
+          alert
+        };
+      })
+      .sort((a, b) => b.driftScore - a.driftScore)
+      .slice(0, 15);
+
+    const liveSummary = {
+      trades: liveRows.length,
+      winRate: liveRows.length === 0 ? 0 : liveRows.filter((x) => x.pnl > 0).length / liveRows.length,
+      avgR: liveRows.length === 0 ? 0 : avg(liveRows.map((x) => x.rMultiple)),
+      totalPnl: sum(liveRows.map((x) => x.pnl)),
+      expectancy: liveRows.length === 0 ? 0 : sum(liveRows.map((x) => x.pnl)) / liveRows.length
+    };
+    const summary = {
+      liveTrades: liveSummary.trades,
+      btTrades: latestBacktest.trades,
+      liveWinRate: liveSummary.winRate,
+      btWinRate: latestBacktest.winRate,
+      deltaWinRate: liveSummary.winRate - latestBacktest.winRate,
+      liveAvgR: liveSummary.avgR,
+      btAvgR: latestBacktest.avgR,
+      deltaAvgR: liveSummary.avgR - latestBacktest.avgR,
+      liveExpectancy: liveSummary.expectancy,
+      btExpectancy: latestBacktest.expectancy,
+      deltaExpectancy: liveSummary.expectancy - latestBacktest.expectancy,
+      alerts: rows.filter((r) => r.alert).length
+    };
+    return {
+      enabled: true,
+      summary,
+      rows,
+      message:
+        liveSummary.trades < 20
+          ? "Live sample is small (<20 trades). Drift confidence is low."
+          : ""
+    };
+  } catch (err) {
+    maybeLogDbError(err);
+    return { enabled: false, summary: null, rows: [], message: "Unable to compute drift report" };
   }
 }
 
@@ -1060,6 +1215,11 @@ function htmlPage() {
         <div id="backtestBySymbol" style="margin-top:8px;"></div>
       </section>
       <section class="card wide">
+        <h2>Live vs Backtest Drift</h2>
+        <div id="driftSummary" class="meta">Loading...</div>
+        <div id="driftTable" style="margin-top:8px;"></div>
+      </section>
+      <section class="card wide">
         <h2>Trade Journal</h2>
         <div class="meta">Tag closed trades with setup quality and mistakes.</div>
         <div style="display:grid; grid-template-columns: repeat(6,minmax(0,1fr)); gap:8px; margin-top:10px;">
@@ -1106,6 +1266,8 @@ function htmlPage() {
     const strategyBySymbol = document.getElementById("strategyBySymbol");
     const backtestSummary = document.getElementById("backtestSummary");
     const backtestBySymbol = document.getElementById("backtestBySymbol");
+    const driftSummary = document.getElementById("driftSummary");
+    const driftTable = document.getElementById("driftTable");
     const journalLot = document.getElementById("journalLot");
     const journalSetup = document.getElementById("journalSetup");
     const journalConfidence = document.getElementById("journalConfidence");
@@ -1143,11 +1305,12 @@ function htmlPage() {
     }
 
     async function load() {
-      const [status, report, strategy, backtest, journal, health] = await Promise.all([
+      const [status, report, strategy, backtest, drift, journal, health] = await Promise.all([
         fetchJsonSafe("/api/status", { runningJob: null, liveMode: false, lastPreflight: null, scheduler: { enabled: false, lastRuns: {} } }),
         fetchJsonSafe("/api/report", { positions: [], managedPositions: [], orders: [], fills: [], lastBrokerSyncAt: null, latestAlerts: [], latestReconcile: [] }),
         fetchJsonSafe("/api/strategy", { enabled: false, bySymbol: [] }),
         fetchJsonSafe("/api/backtest", { enabled: false, latest: null }),
+        fetchJsonSafe("/api/drift", { enabled: false, summary: null, rows: [], message: "" }),
         fetchJsonSafe("/api/journal", { enabled: false, entries: [], closedLots: [], analytics: { bySetup: [], byWeekday: [], avgHoldDays: 0, topMistakes: [] } }),
         fetchJsonSafe("/api/health", { checkedAt: new Date().toISOString(), db: { status: "unknown", latencyMs: null }, broker: { status: "unknown", latencyMs: null }, scheduler: { enabled: false, lastRuns: {} }, errors: [] })
       ]);
@@ -1197,6 +1360,7 @@ function htmlPage() {
       render("fills", report.fills, ["order_id", "symbol", "side", "qty", "price", "fill_time"]);
       renderStrategy(strategy);
       renderBacktest(backtest);
+      renderDrift(drift);
       renderJournal(journal);
       renderHealth(health);
       renderOps(report);
@@ -1341,6 +1505,48 @@ function htmlPage() {
       backtestBySymbol.innerHTML = '<table>' + head + body + '</table>';
     }
 
+    function renderDrift(drift) {
+      if (!drift || !drift.enabled) {
+        driftSummary.textContent = drift && drift.message ? drift.message : 'Drift report unavailable.';
+        driftTable.innerHTML = '<div class="empty">No data</div>';
+        return;
+      }
+      const s = drift.summary;
+      if (!s) {
+        driftSummary.textContent = drift.message || 'No drift baseline available yet.';
+        driftTable.innerHTML = '<div class="empty">No data</div>';
+        return;
+      }
+      driftSummary.textContent =
+        'Live Trades: ' + s.liveTrades +
+        ' | Backtest Trades: ' + s.btTrades +
+        ' | WinRate Drift: ' + signedPct(s.deltaWinRate) +
+        ' | AvgR Drift: ' + signedNum(s.deltaAvgR, 3) +
+        ' | Expectancy Drift: ' + signedInr(s.deltaExpectancy) +
+        ' | Alerts: ' + s.alerts +
+        (drift.message ? (' | Note: ' + drift.message) : '');
+
+      const rows = drift.rows || [];
+      if (rows.length === 0) {
+        driftTable.innerHTML = '<div class="empty">No symbol drift rows</div>';
+        return;
+      }
+      const head =
+        '<tr><th>symbol</th><th>liveTrades</th><th>btTrades</th><th>winRateΔ</th><th>avgRΔ</th><th>expectancyΔ</th><th>alert</th></tr>';
+      const body = rows.map(r =>
+        '<tr>' +
+        '<td class="mono">' + r.symbol + '</td>' +
+        '<td>' + r.liveTrades + '</td>' +
+        '<td>' + r.btTrades + '</td>' +
+        '<td>' + signedPct(r.deltaWinRate) + '</td>' +
+        '<td>' + signedNum(r.deltaAvgR, 3) + '</td>' +
+        '<td>' + signedInr(r.deltaExpectancy) + '</td>' +
+        '<td>' + (r.alert ? 'YES' : '') + '</td>' +
+        '</tr>'
+      ).join('');
+      driftTable.innerHTML = '<table>' + head + body + '</table>';
+    }
+
     function renderJournal(journal) {
       if (!journal || !journal.enabled) {
         journalStatus.textContent = "Journal unavailable (DB not configured).";
@@ -1429,6 +1635,21 @@ function htmlPage() {
 
     function inr(v) {
       return new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 2 }).format(Number(v || 0));
+    }
+
+    function signedNum(v, d) {
+      const n = Number(v || 0);
+      return (n >= 0 ? '+' : '') + n.toFixed(d);
+    }
+
+    function signedPct(v) {
+      const n = Number(v || 0) * 100;
+      return (n >= 0 ? '+' : '') + n.toFixed(2) + '%';
+    }
+
+    function signedInr(v) {
+      const n = Number(v || 0);
+      return (n >= 0 ? '+' : '') + inr(n);
     }
 
     function renderOps(report) {

@@ -300,7 +300,8 @@ async function createRuntime() {
     apiKey: process.env.KITE_API_KEY,
     accessToken: process.env.KITE_ACCESS_TOKEN,
     product: process.env.KITE_PRODUCT ?? "CNC",
-    exchange: process.env.KITE_EXCHANGE ?? "NSE"
+    exchange: process.env.KITE_EXCHANGE ?? "NSE",
+    orderVariety: (process.env.KITE_ORDER_VARIETY as "regular" | "amo" | undefined) ?? "regular"
   });
   const portfolio = new PortfolioService(store, persistence);
   const positionMonitor = new PositionMonitor(
