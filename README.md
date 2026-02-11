@@ -79,6 +79,7 @@ npm run ui
 - `npm run db:report`: show orders/fills/positions/stops/snapshots/state
 - `npm run strategy:report`: win rate, avg R, drawdown, symbol stats
 - `npm run strategy:rebalance`: writes `.env.recommended`
+- `npm run backtest`: historical replay backtest + metrics + JSON export + DB snapshot
 - `npm run weekly`: report + rebalance + CSV export
 
 ## Live Trading Safety
@@ -92,6 +93,21 @@ Use these env controls before enabling live orders:
   - `TELEGRAM_BOT_TOKEN`
   - `TELEGRAM_CHAT_ID`
 - `LIVE_CHECK_MARKET_POLICY=warn|strict` (`strict` fails checklist outside 09:15-15:30 IST)
+
+## Backtest
+Set optional env (or keep defaults):
+- `BACKTEST_FROM=2025-01-01`
+- `BACKTEST_TO=2026-01-31`
+- `BACKTEST_SYMBOLS=RELIANCE,TCS,INFY`
+
+Run:
+```bash
+npm run backtest
+```
+Results:
+- latest run persisted in `backtest_runs` table
+- JSON export at `exports/backtest-latest.json` (configurable via `BACKTEST_EXPORT_PATH`)
+- UI shows latest backtest in **Backtest Analytics**.
 
 ## Recommended Daily Runbook
 1. Refresh token (`npm run auth`) before market open.

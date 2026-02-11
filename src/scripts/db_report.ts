@@ -102,6 +102,21 @@ async function main() {
           )
         : { rowCount: 0, rows: [] as any[] };
 
+    const backtestTable = await pool.query<{ exists: string | null }>(
+      `SELECT to_regclass('public.backtest_runs') AS exists`
+    );
+    const backtests =
+      backtestTable.rows[0]?.exists
+        ? await pool.query(
+            `
+            SELECT run_id, from_date, to_date, symbols_csv, trades, total_pnl, max_drawdown_abs, cagr_pct, created_at
+            FROM backtest_runs
+            ORDER BY created_at DESC
+            LIMIT 5
+            `
+          )
+        : { rowCount: 0, rows: [] as any[] };
+
     console.log("=== DB REPORT ===");
     console.log(`orders(last10): ${orders.rowCount ?? 0}`);
     for (const row of orders.rows) {
@@ -154,6 +169,13 @@ async function main() {
     for (const row of reconcile.rows) {
       console.log(
         `  ${row.created_at.toISOString()} | ${row.run_id} | drift=${row.drift_count} | details=${row.details_json ?? ""}`
+      );
+    }
+
+    console.log(`backtest_runs(last5): ${backtests.rowCount ?? 0}`);
+    for (const row of backtests.rows) {
+      console.log(
+        `  ${row.created_at.toISOString()} | ${row.run_id} | ${formatDate(row.from_date)}->${formatDate(row.to_date)} | trades=${row.trades} | pnl=${row.total_pnl} | dd=${row.max_drawdown_abs} | cagr=${row.cagr_pct}% | symbols=${row.symbols_csv}`
       );
     }
   } catch (err) {

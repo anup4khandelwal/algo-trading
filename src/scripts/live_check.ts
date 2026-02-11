@@ -22,7 +22,8 @@ const REQUIRED_TABLES = [
   "daily_snapshots",
   "system_state",
   "alert_events",
-  "reconcile_audit"
+  "reconcile_audit",
+  "backtest_runs"
 ];
 
 async function main() {

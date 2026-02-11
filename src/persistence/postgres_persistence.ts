@@ -2,6 +2,7 @@ import { Pool } from "pg";
 import { Fill, Order, Position } from "../types.js";
 import {
   AlertEvent,
+  BacktestRunRecord,
   ClosedTradeLot,
   DailySnapshot,
   ManagedPositionRecord,
@@ -101,6 +102,27 @@ export class PostgresPersistence implements Persistence {
         run_id TEXT NOT NULL,
         drift_count INTEGER NOT NULL,
         details_json TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS backtest_runs (
+        id BIGSERIAL PRIMARY KEY,
+        run_id TEXT NOT NULL UNIQUE,
+        from_date DATE NOT NULL,
+        to_date DATE NOT NULL,
+        symbols_csv TEXT NOT NULL,
+        initial_capital DOUBLE PRECISION NOT NULL,
+        final_capital DOUBLE PRECISION NOT NULL,
+        total_pnl DOUBLE PRECISION NOT NULL,
+        trades INTEGER NOT NULL,
+        win_rate DOUBLE PRECISION NOT NULL,
+        avg_r DOUBLE PRECISION NOT NULL,
+        expectancy DOUBLE PRECISION NOT NULL,
+        max_drawdown_abs DOUBLE PRECISION NOT NULL,
+        max_drawdown_pct DOUBLE PRECISION NOT NULL,
+        cagr_pct DOUBLE PRECISION NOT NULL,
+        sharpe_proxy DOUBLE PRECISION NOT NULL,
+        meta_json TEXT,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
     `);
@@ -448,6 +470,96 @@ export class PostgresPersistence implements Persistence {
       detailsJson: row.details_json ?? undefined,
       createdAt: new Date(row.created_at).toISOString()
     }));
+  }
+
+  async insertBacktestRun(
+    run: Omit<BacktestRunRecord, "id" | "createdAt">
+  ): Promise<void> {
+    await this.pool.query(
+      `
+      INSERT INTO backtest_runs (
+        run_id, from_date, to_date, symbols_csv, initial_capital, final_capital,
+        total_pnl, trades, win_rate, avg_r, expectancy, max_drawdown_abs,
+        max_drawdown_pct, cagr_pct, sharpe_proxy, meta_json
+      )
+      VALUES (
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16
+      )
+      ON CONFLICT (run_id)
+      DO UPDATE SET
+        from_date = EXCLUDED.from_date,
+        to_date = EXCLUDED.to_date,
+        symbols_csv = EXCLUDED.symbols_csv,
+        initial_capital = EXCLUDED.initial_capital,
+        final_capital = EXCLUDED.final_capital,
+        total_pnl = EXCLUDED.total_pnl,
+        trades = EXCLUDED.trades,
+        win_rate = EXCLUDED.win_rate,
+        avg_r = EXCLUDED.avg_r,
+        expectancy = EXCLUDED.expectancy,
+        max_drawdown_abs = EXCLUDED.max_drawdown_abs,
+        max_drawdown_pct = EXCLUDED.max_drawdown_pct,
+        cagr_pct = EXCLUDED.cagr_pct,
+        sharpe_proxy = EXCLUDED.sharpe_proxy,
+        meta_json = EXCLUDED.meta_json
+      `,
+      [
+        run.runId,
+        run.fromDate,
+        run.toDate,
+        run.symbolsCsv,
+        run.initialCapital,
+        run.finalCapital,
+        run.totalPnl,
+        run.trades,
+        run.winRate,
+        run.avgR,
+        run.expectancy,
+        run.maxDrawdownAbs,
+        run.maxDrawdownPct,
+        run.cagrPct,
+        run.sharpeProxy,
+        run.metaJson ?? null
+      ]
+    );
+  }
+
+  async loadLatestBacktestRun(): Promise<BacktestRunRecord | null> {
+    const { rows } = await this.pool.query(
+      `
+      SELECT
+        id, run_id, from_date, to_date, symbols_csv, initial_capital, final_capital,
+        total_pnl, trades, win_rate, avg_r, expectancy, max_drawdown_abs,
+        max_drawdown_pct, cagr_pct, sharpe_proxy, meta_json, created_at
+      FROM backtest_runs
+      ORDER BY created_at DESC
+      LIMIT 1
+      `
+    );
+    if (rows.length === 0) {
+      return null;
+    }
+    const row = rows[0];
+    return {
+      id: Number(row.id),
+      runId: row.run_id,
+      fromDate: formatDate(row.from_date),
+      toDate: formatDate(row.to_date),
+      symbolsCsv: row.symbols_csv,
+      initialCapital: Number(row.initial_capital),
+      finalCapital: Number(row.final_capital),
+      totalPnl: Number(row.total_pnl),
+      trades: Number(row.trades),
+      winRate: Number(row.win_rate),
+      avgR: Number(row.avg_r),
+      expectancy: Number(row.expectancy),
+      maxDrawdownAbs: Number(row.max_drawdown_abs),
+      maxDrawdownPct: Number(row.max_drawdown_pct),
+      cagrPct: Number(row.cagr_pct),
+      sharpeProxy: Number(row.sharpe_proxy),
+      metaJson: row.meta_json ?? undefined,
+      createdAt: new Date(row.created_at).toISOString()
+    };
   }
 }
 

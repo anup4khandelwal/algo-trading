@@ -3,11 +3,12 @@ import dotenv from "dotenv";
 import { Pool } from "pg";
 import { runMonitorPass, runMorningWorkflow, runPreflightPass } from "../pipeline.js";
 import { PostgresPersistence } from "../persistence/postgres_persistence.js";
+import { runConfiguredBacktest } from "../backtest/service.js";
 
 dotenv.config();
 
 const PORT = Number(process.env.UI_PORT ?? "3000");
-let runningJob: "morning" | "monitor" | "preflight" | null = null;
+let runningJob: "morning" | "monitor" | "preflight" | "backtest" | null = null;
 let lastDbErrorLogAt = 0;
 
 const server = http.createServer(async (req, res) => {
@@ -40,6 +41,12 @@ const server = http.createServer(async (req, res) => {
     if (method === "GET" && url.pathname === "/api/strategy") {
       const strategy = await getStrategyReport();
       json(res, 200, strategy);
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/api/backtest") {
+      const backtest = await getBacktestReport();
+      json(res, 200, backtest);
       return;
     }
 
@@ -85,6 +92,21 @@ const server = http.createServer(async (req, res) => {
           runningJob = null;
         });
       json(res, 202, { accepted: true, job: "preflight" });
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/api/run/backtest") {
+      if (runningJob) {
+        json(res, 409, { error: `Job already running: ${runningJob}` });
+        return;
+      }
+      runningJob = "backtest";
+      void runConfiguredBacktest()
+        .catch((err) => console.error("BACKTEST_JOB_FAIL", err))
+        .finally(() => {
+          runningJob = null;
+        });
+      json(res, 202, { accepted: true, job: "backtest" });
       return;
     }
 
@@ -290,6 +312,41 @@ async function getStrategyReport() {
       maxDrawdown: 0,
       bySymbol: []
     };
+  }
+}
+
+async function getBacktestReport() {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) {
+    return { enabled: false, latest: null };
+  }
+  const persistence = new PostgresPersistence(databaseUrl);
+  try {
+    await persistence.init();
+    const latest = await persistence.loadLatestBacktestRun();
+    if (!latest) {
+      return { enabled: true, latest: null };
+    }
+    let meta: {
+      bySymbol?: Array<{ symbol: string; trades: number; winRate: number; pnl: number; avgR: number }>;
+      notes?: string[];
+    } | null = null;
+    try {
+      meta = latest.metaJson ? JSON.parse(latest.metaJson) : null;
+    } catch {
+      meta = null;
+    }
+    return {
+      enabled: true,
+      latest: {
+        ...latest,
+        bySymbol: meta?.bySymbol ?? [],
+        notes: meta?.notes ?? []
+      }
+    };
+  } catch (err) {
+    maybeLogDbError(err);
+    return { enabled: false, latest: null };
   }
 }
 
@@ -518,6 +575,7 @@ function htmlPage() {
         <button id="morningBtn" class="btn-main">Run Morning</button>
         <button id="monitorBtn" class="btn-soft">Run Monitor</button>
         <button id="preflightBtn" class="btn-soft">Run Preflight</button>
+        <button id="backtestBtn" class="btn-soft">Run Backtest</button>
         <button id="refreshBtn" class="btn-soft">Refresh</button>
       </div>
       <div class="grid4">
@@ -562,6 +620,11 @@ function htmlPage() {
         <div id="strategyBySymbol" style="margin-top:8px;"></div>
       </section>
       <section class="card wide">
+        <h2>Backtest Analytics</h2>
+        <div id="backtestSummary" class="meta">Loading...</div>
+        <div id="backtestBySymbol" style="margin-top:8px;"></div>
+      </section>
+      <section class="card wide">
         <h2>Ops Events</h2>
         <div id="opsEvents"></div>
       </section>
@@ -572,6 +635,7 @@ function htmlPage() {
     const morningBtn = document.getElementById("morningBtn");
     const monitorBtn = document.getElementById("monitorBtn");
     const preflightBtn = document.getElementById("preflightBtn");
+    const backtestBtn = document.getElementById("backtestBtn");
     const refreshBtn = document.getElementById("refreshBtn");
     const heroSub = document.querySelector(".hero-sub");
     const kpiPositions = document.getElementById("kpiPositions");
@@ -580,11 +644,14 @@ function htmlPage() {
     const kpiFills = document.getElementById("kpiFills");
     const strategySummary = document.getElementById("strategySummary");
     const strategyBySymbol = document.getElementById("strategyBySymbol");
+    const backtestSummary = document.getElementById("backtestSummary");
+    const backtestBySymbol = document.getElementById("backtestBySymbol");
     const opsEvents = document.getElementById("opsEvents");
 
     morningBtn.onclick = () => trigger("/api/run/morning");
     monitorBtn.onclick = () => trigger("/api/run/monitor");
     preflightBtn.onclick = () => trigger("/api/run/preflight");
+    backtestBtn.onclick = () => trigger("/api/run/backtest");
     refreshBtn.onclick = () => load();
 
     async function trigger(path) {
@@ -595,14 +662,16 @@ function htmlPage() {
     }
 
     async function load() {
-      const [statusRes, reportRes, strategyRes] = await Promise.all([
+      const [statusRes, reportRes, strategyRes, backtestRes] = await Promise.all([
         fetch("/api/status"),
         fetch("/api/report"),
-        fetch("/api/strategy")
+        fetch("/api/strategy"),
+        fetch("/api/backtest")
       ]);
       const status = await statusRes.json();
       const report = await reportRes.json();
       const strategy = await strategyRes.json();
+      const backtest = await backtestRes.json();
 
       if (status.runningJob) {
         statusEl.innerHTML = '<span class="dot"></span>Running ' + status.runningJob;
@@ -620,6 +689,7 @@ function htmlPage() {
       morningBtn.disabled = !!status.runningJob;
       monitorBtn.disabled = !!status.runningJob;
       preflightBtn.disabled = !!status.runningJob;
+      backtestBtn.disabled = !!status.runningJob;
 
       kpiPositions.textContent = String((report.positions || []).length);
       kpiStops.textContent = String((report.managedPositions || []).length);
@@ -631,6 +701,7 @@ function htmlPage() {
       render("orders", report.orders, ["order_id", "symbol", "side", "qty", "state", "avg_fill_price", "updated_at"]);
       render("fills", report.fills, ["order_id", "symbol", "side", "qty", "price", "fill_time"]);
       renderStrategy(strategy);
+      renderBacktest(backtest);
       renderOps(report);
     }
 
@@ -695,6 +766,39 @@ function htmlPage() {
         '<tr><td class="mono">' + r.symbol + '</td><td>' + r.trades + '</td><td>' + pct(r.winRate) + '</td><td>' + Number(r.avgR).toFixed(3) + '</td><td>' + inr(r.pnl) + '</td></tr>'
       ).join('');
       strategyBySymbol.innerHTML = '<table>' + head + body + '</table>';
+    }
+
+    function renderBacktest(backtest) {
+      if (!backtest || !backtest.enabled) {
+        backtestSummary.textContent = "Run npm run backtest or start from UI after DB is configured.";
+        backtestBySymbol.innerHTML = '<div class="empty">No data</div>';
+        return;
+      }
+      if (!backtest.latest) {
+        backtestSummary.textContent = "No backtest runs yet. Click Run Backtest.";
+        backtestBySymbol.innerHTML = '<div class="empty">No data</div>';
+        return;
+      }
+      const latest = backtest.latest;
+      backtestSummary.textContent =
+        'Run: ' + latest.runId +
+        ' | Trades: ' + latest.trades +
+        ' | Win Rate: ' + pct(latest.winRate) +
+        ' | PnL: ' + inr(latest.totalPnl) +
+        ' | Max DD: ' + inr(latest.maxDrawdownAbs) +
+        ' | CAGR: ' + Number(latest.cagrPct || 0).toFixed(2) + '%' +
+        ' | Sharpe*: ' + Number(latest.sharpeProxy || 0).toFixed(3);
+
+      const rows = latest.bySymbol || [];
+      if (rows.length === 0) {
+        backtestBySymbol.innerHTML = '<div class="empty">No symbol stats</div>';
+        return;
+      }
+      const head = '<tr><th>symbol</th><th>trades</th><th>winRate</th><th>avgR</th><th>pnl</th></tr>';
+      const body = rows.map(r =>
+        '<tr><td class="mono">' + r.symbol + '</td><td>' + r.trades + '</td><td>' + pct(r.winRate) + '</td><td>' + Number(r.avgR).toFixed(3) + '</td><td>' + inr(r.pnl) + '</td></tr>'
+      ).join('');
+      backtestBySymbol.innerHTML = '<table>' + head + body + '</table>';
     }
 
     function pct(v) {

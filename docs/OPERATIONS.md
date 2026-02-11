@@ -44,6 +44,7 @@ npm run db:report
 Run analytics and export:
 ```bash
 npm run weekly
+npm run backtest
 ```
 This executes:
 - `strategy:report`
@@ -72,4 +73,5 @@ npm run reconcile
 - Live checklist: `npm run live:check`
 - Reports: `npm run db:report`
 - Strategy health: `npm run strategy:report`
+- Backtest health: `npm run backtest`
 - Broker token errors: regenerate via `npm run auth`

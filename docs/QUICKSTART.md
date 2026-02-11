@@ -52,6 +52,12 @@ Open `http://127.0.0.1:3000`.
 npm run live
 ```
 
+## 8) Optional backtest
+```bash
+npm run backtest
+```
+Latest result is exported to `exports/backtest-latest.json` and shown in UI.
+
 ## Safety before live mode
 Set:
 ```env

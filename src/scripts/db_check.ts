@@ -3,7 +3,18 @@ import { Pool } from "pg";
 
 dotenv.config();
 
-const REQUIRED_TABLES = ["orders", "fills", "positions", "managed_positions"];
+const REQUIRED_TABLES = [
+  "orders",
+  "fills",
+  "positions",
+  "managed_positions",
+  "trade_lots",
+  "daily_snapshots",
+  "system_state",
+  "alert_events",
+  "reconcile_audit",
+  "backtest_runs"
+];
 
 async function main() {
   const databaseUrl = process.env.DATABASE_URL;

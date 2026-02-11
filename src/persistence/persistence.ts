@@ -46,6 +46,27 @@ export interface ReconcileAudit {
   createdAt: string;
 }
 
+export interface BacktestRunRecord {
+  id: number;
+  runId: string;
+  fromDate: string;
+  toDate: string;
+  symbolsCsv: string;
+  initialCapital: number;
+  finalCapital: number;
+  totalPnl: number;
+  trades: number;
+  winRate: number;
+  avgR: number;
+  expectancy: number;
+  maxDrawdownAbs: number;
+  maxDrawdownPct: number;
+  cagrPct: number;
+  sharpeProxy: number;
+  metaJson?: string;
+  createdAt: string;
+}
+
 export interface Persistence {
   init(): Promise<void>;
   upsertOrder(order: Order): Promise<void>;
@@ -78,6 +99,8 @@ export interface Persistence {
   loadLatestAlertEvents(limit: number): Promise<AlertEvent[]>;
   insertReconcileAudit(audit: Omit<ReconcileAudit, "id" | "createdAt">): Promise<void>;
   loadLatestReconcileAudits(limit: number): Promise<ReconcileAudit[]>;
+  insertBacktestRun(run: Omit<BacktestRunRecord, "id" | "createdAt">): Promise<void>;
+  loadLatestBacktestRun(): Promise<BacktestRunRecord | null>;
 }
 
 export class NoopPersistence implements Persistence {
@@ -127,5 +150,9 @@ export class NoopPersistence implements Persistence {
   ): Promise<void> {}
   async loadLatestReconcileAudits(_limit: number): Promise<ReconcileAudit[]> {
     return [];
+  }
+  async insertBacktestRun(_run: Omit<BacktestRunRecord, "id" | "createdAt">): Promise<void> {}
+  async loadLatestBacktestRun(): Promise<BacktestRunRecord | null> {
+    return null;
   }
 }
