@@ -10,6 +10,8 @@ import {
 import { PostgresPersistence } from "../persistence/postgres_persistence.js";
 import { runConfiguredBacktest } from "../backtest/service.js";
 import { TradingScheduler } from "../ops/scheduler.js";
+import { ZerodhaAdapter } from "../execution/zerodha_adapter.js";
+import { MapLtpProvider } from "../market_data/ltp_provider.js";
 
 dotenv.config();
 
@@ -17,6 +19,7 @@ const PORT = Number(process.env.UI_PORT ?? "3000");
 type UiJob = "morning" | "monitor" | "preflight" | "backtest" | "eod_close";
 let runningJob: UiJob | null = null;
 let lastDbErrorLogAt = 0;
+const runtimeErrors: Array<{ time: string; source: string; message: string }> = [];
 const scheduler = new TradingScheduler(
   {
     runMorning: () => runUiJob("morning", "SCHED_MORNING", () => runMorningWorkflow()),
@@ -71,6 +74,12 @@ const server = http.createServer(async (req, res) => {
     if (method === "GET" && url.pathname === "/api/report") {
       const report = await getDbReport();
       json(res, 200, report);
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/api/health") {
+      const health = await getHealthReport();
+      json(res, 200, health);
       return;
     }
 
@@ -219,6 +228,7 @@ async function runUiJob(job: UiJob, logTag: string, runner: () => Promise<unknow
     await runner();
   } catch (err) {
     console.error(`${logTag}_FAIL`, err);
+    pushRuntimeError(logTag, err);
     throw err;
   } finally {
     runningJob = null;
@@ -482,6 +492,187 @@ async function getJournalReport() {
   }
 }
 
+async function getHealthReport() {
+  const databaseUrl = process.env.DATABASE_URL;
+  const startedAt = Date.now();
+
+  const db = await checkDbHealth(databaseUrl);
+  const broker = await checkBrokerHealth();
+  const schedulerState = scheduler.getState();
+  const token = getTokenLifetimeEstimate();
+
+  let latestAlertErrors: Array<{ time: string; type: string; message: string }> = [];
+  if (databaseUrl) {
+    const pool = new Pool({ connectionString: databaseUrl });
+    try {
+      const alertTable = await pool.query<{ exists: string | null }>(
+        `SELECT to_regclass('public.alert_events') AS exists`
+      );
+      if (alertTable.rows[0]?.exists) {
+        const rows = await pool.query(
+          `
+          SELECT created_at, type, message
+          FROM alert_events
+          WHERE severity = 'critical'
+          ORDER BY created_at DESC
+          LIMIT 10
+          `
+        );
+        latestAlertErrors = rows.rows.map((r) => ({
+          time: new Date(r.created_at).toISOString(),
+          type: r.type,
+          message: r.message
+        }));
+      }
+    } catch (err) {
+      pushRuntimeError("HEALTH_DB_ALERTS", err);
+    } finally {
+      await pool.end();
+    }
+  }
+
+  const errors = [
+    ...runtimeErrors,
+    ...Object.entries(schedulerState.lastErrors ?? {})
+      .filter(([, msg]) => Boolean(msg))
+      .map(([source, message]) => ({
+        time: new Date().toISOString(),
+        source: `scheduler:${source}`,
+        message: String(message)
+      })),
+    ...latestAlertErrors.map((x) => ({
+      time: x.time,
+      source: `alert:${x.type}`,
+      message: x.message
+    }))
+  ]
+    .sort((a, b) => b.time.localeCompare(a.time))
+    .slice(0, 20);
+
+  return {
+    checkedAt: new Date().toISOString(),
+    latencyMs: Date.now() - startedAt,
+    db,
+    broker,
+    token,
+    scheduler: {
+      enabled: schedulerState.enabled,
+      lastRuns: schedulerState.lastRuns
+    },
+    errors
+  };
+}
+
+async function checkDbHealth(databaseUrl: string | undefined) {
+  if (!databaseUrl) {
+    return { status: "off", latencyMs: null, message: "DATABASE_URL is not set" };
+  }
+  const pool = new Pool({ connectionString: databaseUrl });
+  const started = Date.now();
+  try {
+    await pool.query("SELECT 1");
+    return { status: "ok", latencyMs: Date.now() - started, message: "DB reachable" };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { status: "down", latencyMs: Date.now() - started, message };
+  } finally {
+    await pool.end();
+  }
+}
+
+async function checkBrokerHealth() {
+  if (process.env.LIVE_ORDER_MODE !== "1") {
+    return { status: "paper", latencyMs: null, message: "Paper mode" };
+  }
+  const apiKey = process.env.KITE_API_KEY;
+  const accessToken = process.env.KITE_ACCESS_TOKEN;
+  if (!apiKey || !accessToken) {
+    return { status: "down", latencyMs: null, message: "Kite credentials missing" };
+  }
+  const started = Date.now();
+  try {
+    const adapter = new ZerodhaAdapter(new MapLtpProvider(new Map([["NIFTYBEES", 1]])), {
+      mode: "live",
+      apiKey,
+      accessToken,
+      exchange: process.env.KITE_EXCHANGE ?? "NSE",
+      product: process.env.KITE_PRODUCT ?? "CNC"
+    });
+    const preflight = await adapter.preflightCheck();
+    if (!preflight.ok) {
+      return { status: "down", latencyMs: Date.now() - started, message: preflight.message };
+    }
+    return {
+      status: "ok",
+      latencyMs: Date.now() - started,
+      message: preflight.accountUserId
+        ? `Authenticated as ${preflight.accountUserId}`
+        : "Broker session valid"
+    };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { status: "down", latencyMs: Date.now() - started, message };
+  }
+}
+
+function getTokenLifetimeEstimate() {
+  const createdAtRaw = process.env.KITE_ACCESS_TOKEN_CREATED_AT;
+  const resetHour = Number(process.env.KITE_TOKEN_RESET_HOUR_IST ?? "6");
+  const resetMinute = Number(process.env.KITE_TOKEN_RESET_MINUTE_IST ?? "0");
+  if (!createdAtRaw) {
+    return {
+      known: false,
+      message: "Token creation time unknown. Regenerate via npm run auth for countdown."
+    };
+  }
+  const createdAt = new Date(createdAtRaw);
+  if (Number.isNaN(createdAt.getTime())) {
+    return {
+      known: false,
+      message: "Invalid KITE_ACCESS_TOKEN_CREATED_AT format."
+    };
+  }
+  const expiresAt = nextIstReset(createdAt, resetHour, resetMinute);
+  const leftMs = Math.max(0, expiresAt.getTime() - Date.now());
+  return {
+    known: true,
+    createdAt: createdAt.toISOString(),
+    expiresAt: expiresAt.toISOString(),
+    timeLeftMs: leftMs,
+    timeLeftHuman: humanDuration(leftMs),
+    estimate: true
+  };
+}
+
+function nextIstReset(from: Date, hour: number, minute: number) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  }).formatToParts(from);
+  const year = Number(parts.find((p) => p.type === "year")?.value ?? "1970");
+  const month = Number(parts.find((p) => p.type === "month")?.value ?? "1");
+  const day = Number(parts.find((p) => p.type === "day")?.value ?? "1");
+  const ih = Number(parts.find((p) => p.type === "hour")?.value ?? "0");
+  const im = Number(parts.find((p) => p.type === "minute")?.value ?? "0");
+
+  const resetPassed = ih > hour || (ih === hour && im >= minute);
+  const y = new Date(Date.UTC(year, month - 1, day + (resetPassed ? 1 : 0), hour - 5, minute - 30));
+  return y;
+}
+
+function humanDuration(ms: number) {
+  const sec = Math.floor(ms / 1000);
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  return `${h}h ${m}m`;
+}
+
 function summarizeBySymbol(rows: { symbol: string; pnl: number; rMultiple: number }[]) {
   const map = new Map<
     string,
@@ -540,6 +731,19 @@ function maybeLogDbError(err: unknown) {
   if (now - lastDbErrorLogAt > 60_000) {
     console.error("UI_DB_ERROR", err);
     lastDbErrorLogAt = now;
+  }
+  pushRuntimeError("UI_DB_ERROR", err);
+}
+
+function pushRuntimeError(source: string, err: unknown) {
+  const message = err instanceof Error ? err.message : String(err);
+  runtimeErrors.unshift({
+    time: new Date().toISOString(),
+    source,
+    message
+  });
+  if (runtimeErrors.length > 40) {
+    runtimeErrors.length = 40;
   }
 }
 
@@ -684,6 +888,7 @@ function htmlPage() {
     .hero-top { display:flex; justify-content:space-between; align-items:flex-start; gap: 12px; flex-wrap: wrap; }
     .hero-title { margin: 0; font-size: 28px; letter-spacing: 0.2px; }
     .hero-sub { margin: 4px 0 0; color: #c8f8dc; font-size: 13px; }
+    .hero-meta { margin-top: 4px; color: #dafbe8; font-size: 12px; }
     .toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
     button {
       border: 1px solid rgba(255,255,255,0.2);
@@ -807,7 +1012,7 @@ function htmlPage() {
         <button id="schedulerStopBtn" class="btn-soft">Stop Scheduler</button>
         <button id="refreshBtn" class="btn-soft">Refresh</button>
       </div>
-      <div id="schedulerMeta" class="meta">Scheduler: loading...</div>
+      <div id="schedulerMeta" class="hero-meta">Scheduler: loading...</div>
       <div class="grid4">
         <div class="kpi">
           <p class="kpi-label">Open Positions</p>
@@ -871,6 +1076,11 @@ function htmlPage() {
         <div id="journalEntries" style="margin-top:8px;"></div>
       </section>
       <section class="card wide">
+        <h2>Live Health</h2>
+        <div id="healthSummary" class="meta">Loading...</div>
+        <div id="healthErrors" style="margin-top:8px;"></div>
+      </section>
+      <section class="card wide">
         <h2>Ops Events</h2>
         <div id="opsEvents"></div>
       </section>
@@ -906,6 +1116,8 @@ function htmlPage() {
     const journalStatus = document.getElementById("journalStatus");
     const journalAnalytics = document.getElementById("journalAnalytics");
     const journalEntries = document.getElementById("journalEntries");
+    const healthSummary = document.getElementById("healthSummary");
+    const healthErrors = document.getElementById("healthErrors");
     const opsEvents = document.getElementById("opsEvents");
 
     morningBtn.onclick = () => trigger("/api/run/morning");
@@ -931,18 +1143,14 @@ function htmlPage() {
     }
 
     async function load() {
-      const [statusRes, reportRes, strategyRes, backtestRes, journalRes] = await Promise.all([
-        fetch("/api/status"),
-        fetch("/api/report"),
-        fetch("/api/strategy"),
-        fetch("/api/backtest"),
-        fetch("/api/journal")
+      const [status, report, strategy, backtest, journal, health] = await Promise.all([
+        fetchJsonSafe("/api/status", { runningJob: null, liveMode: false, lastPreflight: null, scheduler: { enabled: false, lastRuns: {} } }),
+        fetchJsonSafe("/api/report", { positions: [], managedPositions: [], orders: [], fills: [], lastBrokerSyncAt: null, latestAlerts: [], latestReconcile: [] }),
+        fetchJsonSafe("/api/strategy", { enabled: false, bySymbol: [] }),
+        fetchJsonSafe("/api/backtest", { enabled: false, latest: null }),
+        fetchJsonSafe("/api/journal", { enabled: false, entries: [], closedLots: [], analytics: { bySetup: [], byWeekday: [], avgHoldDays: 0, topMistakes: [] } }),
+        fetchJsonSafe("/api/health", { checkedAt: new Date().toISOString(), db: { status: "unknown", latencyMs: null }, broker: { status: "unknown", latencyMs: null }, scheduler: { enabled: false, lastRuns: {} }, errors: [] })
       ]);
-      const status = await statusRes.json();
-      const report = await reportRes.json();
-      const strategy = await strategyRes.json();
-      const backtest = await backtestRes.json();
-      const journal = await journalRes.json();
 
       if (status.runningJob) {
         statusEl.innerHTML = '<span class="dot"></span>Running ' + status.runningJob;
@@ -990,7 +1198,21 @@ function htmlPage() {
       renderStrategy(strategy);
       renderBacktest(backtest);
       renderJournal(journal);
+      renderHealth(health);
       renderOps(report);
+    }
+
+    async function fetchJsonSafe(path, fallback) {
+      try {
+        const res = await fetch(path);
+        const body = await res.json();
+        if (!res.ok) {
+          return fallback;
+        }
+        return body;
+      } catch {
+        return fallback;
+      }
     }
 
     async function saveJournalEntry() {
@@ -1167,6 +1389,38 @@ function htmlPage() {
         ).join('');
         journalEntries.innerHTML = '<table>' + head + body + '</table>';
       }
+    }
+
+    function renderHealth(health) {
+      if (!health) {
+        healthSummary.textContent = 'Health data unavailable';
+        healthErrors.innerHTML = '<div class="empty">No errors</div>';
+        return;
+      }
+      const dbStatus = health.db && health.db.status ? health.db.status.toUpperCase() : 'N/A';
+      const brokerStatus = health.broker && health.broker.status ? health.broker.status.toUpperCase() : 'N/A';
+      const dbLatency = health.db && health.db.latencyMs !== null ? (health.db.latencyMs + 'ms') : 'n/a';
+      const brokerLatency = health.broker && health.broker.latencyMs !== null ? (health.broker.latencyMs + 'ms') : 'n/a';
+      const tokenText = health.token && health.token.known
+        ? ('Token Left (est): ' + health.token.timeLeftHuman + ' | Expires: ' + new Date(health.token.expiresAt).toLocaleString('en-IN'))
+        : ('Token Left (est): ' + ((health.token && health.token.message) ? health.token.message : 'unknown'));
+      healthSummary.textContent =
+        'DB: ' + dbStatus + ' (' + dbLatency + ')' +
+        ' | Broker: ' + brokerStatus + ' (' + brokerLatency + ')' +
+        ' | Scheduler: ' + ((health.scheduler && health.scheduler.enabled) ? 'ON' : 'OFF') +
+        ' | ' + tokenText +
+        ' | Checked: ' + new Date(health.checkedAt).toLocaleString('en-IN');
+
+      const rows = health.errors || [];
+      if (rows.length === 0) {
+        healthErrors.innerHTML = '<div class="empty">No recent errors</div>';
+        return;
+      }
+      const head = '<tr><th>time</th><th>source</th><th>message</th></tr>';
+      const body = rows.map(r =>
+        '<tr><td>' + new Date(r.time).toLocaleString('en-IN') + '</td><td class="mono">' + r.source + '</td><td>' + r.message + '</td></tr>'
+      ).join('');
+      healthErrors.innerHTML = '<table>' + head + body + '</table>';
     }
 
     function pct(v) {

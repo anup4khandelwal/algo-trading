@@ -92,7 +92,13 @@ async function updateEnvFile(accessToken: string) {
   }
 
   const lines = content.split(/\r?\n/).filter((l) => l.length > 0);
-  const filtered = lines.filter((l) => !l.startsWith("KITE_ACCESS_TOKEN="));
+  const createdAt = new Date().toISOString();
+  const filtered = lines.filter(
+    (l) =>
+      !l.startsWith("KITE_ACCESS_TOKEN=") &&
+      !l.startsWith("KITE_ACCESS_TOKEN_CREATED_AT=")
+  );
   filtered.push(`KITE_ACCESS_TOKEN=${accessToken}`);
+  filtered.push(`KITE_ACCESS_TOKEN_CREATED_AT=${createdAt}`);
   await fs.writeFile(path, filtered.join("\n") + "\n");
 }

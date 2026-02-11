@@ -136,6 +136,20 @@ Scheduler env (optional):
 - `SCHEDULER_BACKTEST_WEEKDAY=Sat`
 - `SCHEDULER_BACKTEST_AT=10:30`
 
+## Live Health Panel
+UI now includes **Live Health** with:
+- DB heartbeat + latency
+- broker preflight heartbeat + latency (in live mode)
+- Kite token time-left estimate (after token generation)
+- scheduler on/off snapshot
+- recent error timeline (runtime, scheduler, critical alerts)
+
+Token countdown notes:
+- `npm run auth` now updates both `KITE_ACCESS_TOKEN` and `KITE_ACCESS_TOKEN_CREATED_AT`
+- expiry shown is an estimate using IST reset window:
+  - `KITE_TOKEN_RESET_HOUR_IST` (default `6`)
+  - `KITE_TOKEN_RESET_MINUTE_IST` (default `0`)
+
 ## Recommended Daily Runbook
 1. Refresh token (`npm run auth`) before market open.
 2. Run `npm run morning`.
