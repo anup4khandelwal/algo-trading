@@ -10,8 +10,10 @@ import {
   runManualStopUpdate,
   runMonitorPass,
   runMorningWorkflow,
+  previewMorningOrders,
   runPreflightPass
 } from "../pipeline.js";
+import PDFDocument from "pdfkit";
 import { PostgresPersistence } from "../persistence/postgres_persistence.js";
 import { NoopPersistence } from "../persistence/persistence.js";
 import { runConfiguredBacktest } from "../backtest/service.js";
@@ -218,6 +220,12 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (method === "GET" && url.pathname === "/api/morning/preview") {
+      const preview = await previewMorningOrders();
+      json(res, 200, preview);
+      return;
+    }
+
     if (method === "GET" && url.pathname === "/api/strategy-lab/latest") {
       const data = await getStrategyLabReport();
       json(res, 200, data);
@@ -233,6 +241,22 @@ const server = http.createServer(async (req, res) => {
     if (method === "GET" && url.pathname === "/api/journal") {
       const journal = await getJournalReport();
       json(res, 200, journal);
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/api/pnl-attribution") {
+      const report = await getPnlAttributionReport();
+      json(res, 200, report);
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/api/reports/weekly.pdf") {
+      const pdf = await buildWeeklyPdfReport();
+      res.writeHead(200, {
+        "Content-Type": "application/pdf",
+        "Content-Disposition": `attachment; filename="weekly-report-${getIstTradeDate()}.pdf"`
+      });
+      res.end(pdf);
       return;
     }
 
@@ -1160,6 +1184,155 @@ async function getJournalReport() {
     maybeLogDbError(err);
     return { enabled: false, entries: [], closedLots: [], analytics: emptyJournalAnalytics() };
   }
+}
+
+async function getPnlAttributionReport() {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) {
+    return { enabled: false, rows: [], bySymbol: [], bySetup: [] };
+  }
+  const persistence = new PostgresPersistence(databaseUrl);
+  try {
+    await persistence.init();
+    const lookback = Number(process.env.STRATEGY_REPORT_LOOKBACK ?? "200");
+    const [lots, entries] = await Promise.all([
+      persistence.loadClosedTradeLots(lookback),
+      persistence.loadTradeJournalEntries(500)
+    ]);
+    const entryByLot = new Map(entries.map((x) => [x.lotId, x]));
+    const rowsRaw = lots.map((lot) => {
+      const tag = entryByLot.get(lot.id)?.setupTag?.trim() || "unlabeled";
+      const pnl = (lot.exitPrice - lot.entryPrice) * lot.qty;
+      return {
+        symbol: lot.symbol,
+        setupTag: tag,
+        pnl,
+        tradeCount: 1,
+        wins: pnl > 0 ? 1 : 0
+      };
+    });
+    const grouped = new Map<string, { symbol: string; setupTag: string; pnl: number; tradeCount: number; wins: number }>();
+    for (const row of rowsRaw) {
+      const key = `${row.symbol}::${row.setupTag}`;
+      const cur = grouped.get(key) ?? {
+        symbol: row.symbol,
+        setupTag: row.setupTag,
+        pnl: 0,
+        tradeCount: 0,
+        wins: 0
+      };
+      cur.pnl += row.pnl;
+      cur.tradeCount += 1;
+      cur.wins += row.wins;
+      grouped.set(key, cur);
+    }
+    const rows = Array.from(grouped.values())
+      .map((x) => ({
+        ...x,
+        winRate: x.tradeCount === 0 ? 0 : x.wins / x.tradeCount,
+        avgPnl: x.tradeCount === 0 ? 0 : x.pnl / x.tradeCount
+      }))
+      .sort((a, b) => b.pnl - a.pnl);
+    const bySymbol = aggregate(rows, (x) => x.symbol);
+    const bySetup = aggregate(rows, (x) => x.setupTag);
+    return { enabled: true, rows, bySymbol, bySetup };
+  } catch (err) {
+    maybeLogDbError(err);
+    return { enabled: false, rows: [], bySymbol: [], bySetup: [] };
+  }
+}
+
+async function buildWeeklyPdfReport(): Promise<Buffer> {
+  const [report, strategy, drift, recommendation, backtest, pnlAttrib] = await Promise.all([
+    getDbReport(),
+    getStrategyReport(),
+    getDriftReport(),
+    getProfileRecommendation(),
+    getBacktestReport(),
+    getPnlAttributionReport()
+  ]);
+
+  const doc = new PDFDocument({ size: "A4", margin: 40 });
+  const chunks: Buffer[] = [];
+  const done = new Promise<Buffer>((resolve, reject) => {
+    doc.on("data", (c: Buffer) => chunks.push(c));
+    doc.on("end", () => resolve(Buffer.concat(chunks)));
+    doc.on("error", (err) => reject(err));
+  });
+
+  const writeSection = (title: string, lines: string[]) => {
+    doc.fontSize(14).fillColor("#0b2540").text(title, { underline: false });
+    doc.moveDown(0.3);
+    doc.fontSize(10).fillColor("#1f2937");
+    for (const line of lines) {
+      doc.text(`- ${line}`);
+    }
+    doc.moveDown(0.8);
+  };
+
+  doc.fontSize(18).fillColor("#0b2540").text("Algo Trading Weekly Report");
+  doc.fontSize(10).fillColor("#6b7280").text(`Generated: ${new Date().toLocaleString("en-IN")}`);
+  doc.moveDown(1);
+
+  writeSection("Overview", [
+    `Mode: ${process.env.LIVE_ORDER_MODE === "1" ? "LIVE" : "PAPER"}`,
+    `Safe Mode: ${getSafeModeState().enabled ? "ON" : "OFF"}`,
+    `Open Positions: ${report.positions?.length ?? 0}`,
+    `Funds (usable): ${inrNum(Number(report.funds?.usableEquity ?? 0))}`
+  ]);
+
+  writeSection("Strategy Metrics", [
+    `Closed lots: ${strategy.closedLots ?? 0}`,
+    `Win rate: ${pctNum(Number(strategy.winRate ?? 0))}`,
+    `Avg R: ${numFixed(Number(strategy.avgR ?? 0), 3)}`,
+    `Total PnL: ${inrNum(Number(strategy.totalPnl ?? 0))}`,
+    `Max Drawdown: ${inrNum(Number(strategy.maxDrawdown ?? 0))}`
+  ]);
+
+  const driftRows = (drift.rows ?? []).slice(0, 8).map(
+    (x: any) =>
+      `${x.symbol}: winRateΔ=${signedPctNum(Number(x.deltaWinRate ?? 0))}, avgRΔ=${signedNumFixed(Number(x.deltaAvgR ?? 0), 3)}, alert=${x.alert ? "YES" : "NO"}`
+  );
+  writeSection("Drift Snapshot", [
+    `Drift alerts: ${Number(drift.summary?.alerts ?? 0)}`,
+    ...driftRows
+  ]);
+
+  const blocked = Object.entries(report.rejectGuard?.blockedSymbols ?? {});
+  writeSection("Reject Guard", [
+    `Blocked symbols today: ${blocked.length}`,
+    ...blocked.slice(0, 10).map(([sym, v]) => `${sym}: count=${(v as any).count}, reason=${(v as any).reason}`)
+  ]);
+
+  writeSection("Profile Recommendation", [
+    `Active: ${recommendation.activeProfile}`,
+    `Recommended: ${recommendation.recommendedProfile}`,
+    `Score: ${recommendation.score}`,
+    ...(recommendation.reasons ?? []).slice(0, 6).map((x) => `Reason: ${x}`),
+    ...(recommendation.blockers ?? []).slice(0, 4).map((x) => `Blocker: ${x}`)
+  ]);
+
+  if (backtest.latest) {
+    writeSection("Backtest Baseline", [
+      `Run: ${backtest.latest.runId}`,
+      `Trades: ${backtest.latest.trades}`,
+      `Win rate: ${pctNum(Number(backtest.latest.winRate ?? 0))}`,
+      `PnL: ${inrNum(Number(backtest.latest.totalPnl ?? 0))}`,
+      `CAGR: ${numFixed(Number(backtest.latest.cagrPct ?? 0), 2)}%`
+    ]);
+  }
+
+  writeSection("PnL Attribution (Top Symbol+Setup)", [
+    ...(pnlAttrib.rows ?? [])
+      .slice(0, 12)
+      .map(
+        (x: any) =>
+          `${x.symbol} | ${x.setupTag}: pnl=${inrNum(Number(x.pnl ?? 0))}, trades=${x.tradeCount}, winRate=${pctNum(Number(x.winRate ?? 0))}`
+      )
+  ]);
+
+  doc.end();
+  return done;
 }
 
 async function getDriftReport() {
@@ -2299,8 +2472,50 @@ function sum(values: number[]) {
   return values.reduce((acc, v) => acc + v, 0);
 }
 
+function aggregate<T extends { pnl: number; tradeCount: number; wins: number }>(
+  rows: T[],
+  keyFn: (x: T) => string
+) {
+  const map = new Map<string, { key: string; pnl: number; tradeCount: number; wins: number }>();
+  for (const row of rows) {
+    const key = keyFn(row);
+    const cur = map.get(key) ?? { key, pnl: 0, tradeCount: 0, wins: 0 };
+    cur.pnl += Number(row.pnl ?? 0);
+    cur.tradeCount += Number(row.tradeCount ?? 0);
+    cur.wins += Number(row.wins ?? 0);
+    map.set(key, cur);
+  }
+  return Array.from(map.values())
+    .map((x) => ({
+      key: x.key,
+      pnl: x.pnl,
+      tradeCount: x.tradeCount,
+      winRate: x.tradeCount === 0 ? 0 : x.wins / x.tradeCount,
+      avgPnl: x.tradeCount === 0 ? 0 : x.pnl / x.tradeCount
+    }))
+    .sort((a, b) => b.pnl - a.pnl);
+}
+
 function avg(values: number[]) {
   return values.length === 0 ? 0 : sum(values) / values.length;
+}
+
+function numFixed(value: number, digits = 2) {
+  return Number(value ?? 0).toFixed(digits);
+}
+
+function pctNum(value: number) {
+  return `${(Number(value ?? 0) * 100).toFixed(2)}%`;
+}
+
+function signedPctNum(value: number) {
+  const v = Number(value ?? 0) * 100;
+  return `${v >= 0 ? "+" : ""}${v.toFixed(2)}%`;
+}
+
+function signedNumFixed(value: number, digits = 2) {
+  const v = Number(value ?? 0);
+  return `${v >= 0 ? "+" : ""}${v.toFixed(digits)}`;
 }
 
 function maxDrawdownFromPnL(pnlSeries: number[]) {

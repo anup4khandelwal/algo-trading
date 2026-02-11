@@ -213,6 +213,40 @@ type EodSummaryPayload = {
   } | null;
 };
 
+type MorningPreviewPayload = {
+  generatedAt: string;
+  liveMode: boolean;
+  preflight?: { ok?: boolean; message?: string };
+  funds?: { usableEquity: number };
+  summary?: { totalSignals: number; eligible: number; skipped: number };
+  rows: Array<{
+    symbol: string;
+    side: string;
+    qty: number;
+    entryPrice: number;
+    stopPrice: number;
+    targetPrice: number | null;
+    notional: number;
+    rankScore: number;
+    status: "eligible" | "skip";
+    reason: string;
+  }>;
+};
+
+type PnlAttributionPayload = {
+  enabled: boolean;
+  rows: Array<{
+    symbol: string;
+    setupTag: string;
+    pnl: number;
+    tradeCount: number;
+    winRate: number;
+    avgPnl: number;
+  }>;
+  bySymbol: Array<{ key: string; pnl: number; tradeCount: number; winRate: number; avgPnl: number }>;
+  bySetup: Array<{ key: string; pnl: number; tradeCount: number; winRate: number; avgPnl: number }>;
+};
+
 const fallbackStatus: StatusPayload = {
   runningJob: null,
   liveMode: false,
@@ -278,6 +312,20 @@ const fallbackProfileRec: ProfileRecommendationPayload = {
 };
 const fallbackPreopen: PreopenPayload = { ok: false, checkedAt: new Date(0).toISOString(), checks: [] };
 const fallbackEodSummary: EodSummaryPayload = { available: false, summary: null };
+const fallbackMorningPreview: MorningPreviewPayload = {
+  generatedAt: "",
+  liveMode: false,
+  preflight: { ok: false, message: "" },
+  funds: { usableEquity: 0 },
+  summary: { totalSignals: 0, eligible: 0, skipped: 0 },
+  rows: []
+};
+const fallbackPnlAttribution: PnlAttributionPayload = {
+  enabled: false,
+  rows: [],
+  bySymbol: [],
+  bySetup: []
+};
 
 export default function App() {
   const [status, setStatus] = useState<StatusPayload>(fallbackStatus);
@@ -293,6 +341,10 @@ export default function App() {
   const [profileRec, setProfileRec] = useState<ProfileRecommendationPayload>(fallbackProfileRec);
   const [preopen, setPreopen] = useState<PreopenPayload>(fallbackPreopen);
   const [eodSummary, setEodSummary] = useState<EodSummaryPayload>(fallbackEodSummary);
+  const [pnlAttrib, setPnlAttrib] = useState<PnlAttributionPayload>(fallbackPnlAttribution);
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [previewBusy, setPreviewBusy] = useState(false);
+  const [morningPreview, setMorningPreview] = useState<MorningPreviewPayload>(fallbackMorningPreview);
 
   const [busy, setBusy] = useState(false);
   const [lastRefresh, setLastRefresh] = useState<string>("");
@@ -335,7 +387,7 @@ export default function App() {
   }
 
   async function load() {
-    const [s, r, h, b, st, bt, sl, dr, jr, ps, pr, po, eod] = await Promise.all([
+    const [s, r, h, b, st, bt, sl, dr, jr, pa, ps, pr, po, eod] = await Promise.all([
       fetchJson<StatusPayload>("/api/status", fallbackStatus),
       fetchJson<ReportPayload>("/api/report", fallbackReport),
       fetchJson<HealthPayload>("/api/health", fallbackHealth),
@@ -345,6 +397,7 @@ export default function App() {
       fetchJson<StrategyLabPayload>("/api/strategy-lab/latest", fallbackStrategyLab),
       fetchJson<DriftPayload>("/api/drift", fallbackDrift),
       fetchJson<JournalPayload>("/api/journal", fallbackJournal),
+      fetchJson<PnlAttributionPayload>("/api/pnl-attribution", fallbackPnlAttribution),
       fetchJson<ProfileStatusPayload>("/api/profile/status", fallbackProfileStatus),
       fetchJson<ProfileRecommendationPayload>("/api/profile/recommendation", fallbackProfileRec),
       fetchJson<PreopenPayload>("/api/preopen-check", fallbackPreopen),
@@ -359,6 +412,7 @@ export default function App() {
     setStrategyLab(sl);
     setDrift(dr);
     setJournal(jr);
+    setPnlAttrib(pa);
     setProfileStatus(ps);
     setProfileRec(pr);
     setPreopen(po);
@@ -390,6 +444,31 @@ export default function App() {
       await load();
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function openMorningPreview() {
+    setPreviewOpen(true);
+    setPreviewBusy(true);
+    try {
+      const preview = await fetchJson<MorningPreviewPayload>(
+        "/api/morning/preview",
+        fallbackMorningPreview
+      );
+      setMorningPreview(preview);
+    } finally {
+      setPreviewBusy(false);
+    }
+  }
+
+  async function confirmMorningRun() {
+    setPreviewBusy(true);
+    try {
+      await fetch("/api/run/morning", { method: "POST" });
+      setPreviewOpen(false);
+      await load();
+    } finally {
+      setPreviewBusy(false);
     }
   }
 
@@ -583,13 +662,14 @@ export default function App() {
       </header>
 
       <section className="actions">
-        <button disabled={busy || safeModeOn || !preopen.ok} onClick={() => void postAction("/api/run/morning")} className="btn btn-primary">Morning</button>
+        <button disabled={busy || safeModeOn || !preopen.ok} onClick={() => void openMorningPreview()} className="btn btn-primary">Morning</button>
         <button disabled={busy} onClick={() => void postAction("/api/run/monitor")} className="btn">Monitor</button>
         <button disabled={busy} onClick={() => void postAction("/api/run/preflight")} className="btn">Preflight</button>
         <button disabled={busy} onClick={() => void postAction("/api/run/eod")} className="btn">EOD</button>
         <button disabled={busy} onClick={() => void postAction("/api/run/backtest")} className="btn">Backtest</button>
         <button disabled={busy} onClick={() => void postAction("/api/strategy-lab/run")} className="btn">Strategy Lab</button>
         <button disabled={busy} onClick={() => void postAction("/api/funds/recompute")} className="btn">Recompute Funds</button>
+        <button disabled={busy} onClick={() => window.open("/api/reports/weekly.pdf", "_blank")} className="btn">Weekly PDF</button>
         <button disabled={busy || safeModeOn} onClick={() => void postAction("/api/scheduler/start")} className="btn">Start Scheduler</button>
         <button disabled={busy} onClick={() => void postAction("/api/scheduler/stop")} className="btn">Stop Scheduler</button>
         <button disabled={busy || safeModeOn} onClick={() => void postAction("/api/safe-mode/enable", { reason: "React dashboard toggle" })} className="btn btn-danger">Enable Safe Mode</button>
@@ -839,6 +919,45 @@ export default function App() {
           />
         </Card>
 
+        <Card title="PnL Attribution" span="wide">
+          <div className="meta-line">
+            Explains where PnL comes from by `symbol + setupTag`.
+          </div>
+          <SimpleTable
+            columns={["symbol", "setupTag", "trades", "winRate", "avgPnl", "totalPnl"]}
+            rows={(pnlAttrib.rows ?? []).slice(0, 20).map((x) => [
+              x.symbol,
+              x.setupTag,
+              String(x.tradeCount),
+              pct(x.winRate),
+              inr(x.avgPnl),
+              inr(x.pnl)
+            ])}
+          />
+          <div className="meta-line">By Symbol (top 10)</div>
+          <SimpleTable
+            columns={["symbol", "trades", "winRate", "avgPnl", "totalPnl"]}
+            rows={(pnlAttrib.bySymbol ?? []).slice(0, 10).map((x) => [
+              x.key,
+              String(x.tradeCount),
+              pct(x.winRate),
+              inr(x.avgPnl),
+              inr(x.pnl)
+            ])}
+          />
+          <div className="meta-line">By Setup Tag (top 10)</div>
+          <SimpleTable
+            columns={["setupTag", "trades", "winRate", "avgPnl", "totalPnl"]}
+            rows={(pnlAttrib.bySetup ?? []).slice(0, 10).map((x) => [
+              x.key,
+              String(x.tradeCount),
+              pct(x.winRate),
+              inr(x.avgPnl),
+              inr(x.pnl)
+            ])}
+          />
+        </Card>
+
         <Card title="Daily Equity Curve" span="wide">
           <svg viewBox="0 0 1000 220" className="chart" preserveAspectRatio="none">
             <rect x="0" y="0" width="1000" height="220" fill="#ffffff" />
@@ -900,6 +1019,50 @@ export default function App() {
           )}
         </Card>
       </section>
+
+      {previewOpen ? (
+        <div className="modal-backdrop" onClick={() => !previewBusy && setPreviewOpen(false)}>
+          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+            <div className="card-head">
+              <h2>Order Preview Before Morning Run</h2>
+              <div className="card-sub">
+                Generated: {morningPreview.generatedAt ? new Date(morningPreview.generatedAt).toLocaleString("en-IN") : "n/a"}
+              </div>
+            </div>
+            <div className="meta-line">
+              Preflight: {morningPreview.preflight?.ok ? "PASS" : "FAIL"} | Eligible: {morningPreview.summary?.eligible ?? 0} | Skipped: {morningPreview.summary?.skipped ?? 0} | Usable Funds: {inr(morningPreview.funds?.usableEquity ?? 0)}
+            </div>
+            {previewBusy ? (
+              <div className="empty">Loading preview...</div>
+            ) : (
+              <SimpleTable
+                columns={["symbol", "qty", "entry", "stop", "notional", "rank", "status", "reason"]}
+                rows={(morningPreview.rows ?? []).slice(0, 25).map((x) => [
+                  x.symbol,
+                  String(x.qty),
+                  num(x.entryPrice, 2),
+                  num(x.stopPrice, 2),
+                  inr(x.notional),
+                  num(x.rankScore, 2),
+                  x.status.toUpperCase(),
+                  x.reason
+                ])}
+              />
+            )}
+            <div className="actions-inline" style={{ marginTop: 12 }}>
+              <button className="btn" disabled={previewBusy} onClick={() => void openMorningPreview()}>Refresh Preview</button>
+              <button className="btn" disabled={previewBusy} onClick={() => setPreviewOpen(false)}>Cancel</button>
+              <button
+                className="btn btn-primary"
+                disabled={previewBusy || !(morningPreview.preflight?.ok) || (morningPreview.summary?.eligible ?? 0) === 0}
+                onClick={() => void confirmMorningRun()}
+              >
+                Confirm Morning Run
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

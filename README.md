@@ -138,6 +138,7 @@ When `dashboard/dist/index.html` exists, `npm run ui` serves React UI by default
 - `POST /api/strategy-lab/apply`: apply selected candidate params to `.env`
 - `npm run journal:export`: exports joined closed-trade + journal tags CSV
 - `npm run weekly`: report + rebalance + CSV export
+- UI download: `GET /api/reports/weekly.pdf` for weekly PDF summary
 
 ## Live Trading Safety
 Use these env controls before enabling live orders:
@@ -193,6 +194,22 @@ Results:
 ```bash
 npm run journal:export
 ```
+
+## Order Preview (UI)
+- Morning run now uses preview-first flow.
+- `GET /api/morning/preview` returns:
+  - proposed orders (qty/entry/stop/notional/rank),
+  - eligibility/skip reason per symbol,
+  - preflight status and usable funds snapshot.
+- In dashboard, click **Morning** -> review preview -> **Confirm Morning Run**.
+
+## PnL Attribution
+- New endpoint: `GET /api/pnl-attribution`
+- Groups live closed-lot PnL by:
+  - `symbol + setupTag` (primary)
+  - `symbol` (aggregate)
+  - `setupTag` (aggregate)
+- Dashboard includes **PnL Attribution** card.
 
 ## UI Scheduler Automation
 From UI (`http://127.0.0.1:3000`) you can:

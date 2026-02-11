@@ -85,7 +85,8 @@ npm run auth
 
 ### B) Market open to entry window
 1. Disable Safe Mode.
-2. Click **Morning** once.
+2. Click **Morning** and review **Order Preview** modal.
+3. Confirm only when preflight is PASS and eligible signals look valid.
 3. Review:
 - **Broker Orderbook** (rejections, hints)
 - **Positions** and **Managed Stops**
@@ -180,6 +181,15 @@ Apply behavior:
 - enables Safe Mode,
 - stops scheduler.
 Resume trading only after explicit verification.
+
+## Weekly PDF Report
+- Dashboard action bar has **Weekly PDF** button.
+- It downloads a generated report with:
+  - strategy metrics,
+  - drift snapshot,
+  - reject guard status,
+  - profile recommendation,
+  - top PnL attribution rows.
 
 ## Live vs Backtest Drift
 Compares live behavior to backtest baseline.

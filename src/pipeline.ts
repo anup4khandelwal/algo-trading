@@ -19,6 +19,42 @@ export async function runDailyPipeline() {
   await runMorningWorkflow();
 }
 
+export type MorningPreviewRow = {
+  symbol: string;
+  side: "BUY";
+  qty: number;
+  entryPrice: number;
+  stopPrice: number;
+  targetPrice: number | null;
+  notional: number;
+  rankScore: number;
+  status: "eligible" | "skip";
+  reason: string;
+};
+
+export async function previewMorningOrders() {
+  dotenv.config();
+  const runtime = await createRuntime();
+  const preflight = await runtime.exec.preflightCheck();
+  const { store, signalBuilder, risk, persistence } = runtime;
+  const signals = signalBuilder.buildSignals(await runtime.screener.getCandidates(), store.equity);
+  const rows = await evaluateSignalsForPreview(signals, store, risk, persistence);
+  return {
+    generatedAt: new Date().toISOString(),
+    liveMode: runtime.exec.isLiveMode(),
+    preflight,
+    funds: {
+      usableEquity: store.equity
+    },
+    summary: {
+      totalSignals: rows.length,
+      eligible: rows.filter((x) => x.status === "eligible").length,
+      skipped: rows.filter((x) => x.status === "skip").length
+    },
+    rows
+  };
+}
+
 export async function runMorningWorkflow() {
   dotenv.config();
   const runtime = await createRuntime();
@@ -388,6 +424,62 @@ async function placeSignals(
       }
     }
   }
+}
+
+async function evaluateSignalsForPreview(
+  signals: Signal[],
+  store: InMemoryStore,
+  risk: RiskEngine,
+  persistence: Awaited<ReturnType<typeof buildPersistence>>
+): Promise<MorningPreviewRow[]> {
+  const rejectGuard = await loadRejectGuardState(persistence);
+  const maxNotionalPerOrder = Number(process.env.MAX_NOTIONAL_PER_ORDER ?? "500000");
+  const allowedSymbols = parseCsvSet(process.env.ALLOWED_SYMBOLS);
+  let remainingFunds = Math.max(0, store.equity);
+  const rows: MorningPreviewRow[] = [];
+  for (const signal of signals) {
+    let status: "eligible" | "skip" = "eligible";
+    let reason = "Eligible";
+    const notional = signal.qty * signal.entryPrice;
+    if (rejectGuard.blockedSymbols[signal.symbol]) {
+      status = "skip";
+      reason = "Blocked by reject guard for today";
+    } else if (allowedSymbols && !allowedSymbols.has(signal.symbol)) {
+      status = "skip";
+      reason = "Symbol not in ALLOWED_SYMBOLS";
+    } else if (notional > remainingFunds) {
+      status = "skip";
+      reason = "Insufficient remaining usable funds";
+    } else if (notional > maxNotionalPerOrder) {
+      status = "skip";
+      reason = "Max notional per order breached";
+    } else if (hasDuplicateOrderForToday(store, signal.symbol)) {
+      status = "skip";
+      reason = "Duplicate order guard";
+    } else {
+      const check = risk.preTradeCheck(signal);
+      if (!check.ok) {
+        status = "skip";
+        reason = check.reason ?? "Risk check failed";
+      }
+    }
+    rows.push({
+      symbol: signal.symbol,
+      side: "BUY",
+      qty: signal.qty,
+      entryPrice: signal.entryPrice,
+      stopPrice: signal.stopPrice,
+      targetPrice: signal.targetPrice ?? null,
+      notional,
+      rankScore: signal.rankScore,
+      status,
+      reason
+    });
+    if (status === "eligible") {
+      remainingFunds = Math.max(0, remainingFunds - notional);
+    }
+  }
+  return rows;
 }
 
 async function runMonitorCycles(positionMonitor: PositionMonitor) {
