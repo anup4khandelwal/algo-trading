@@ -79,6 +79,50 @@ export class ZerodhaAdapter {
     };
   }
 
+  async fetchAvailableFunds(): Promise<{
+    availableCash: number;
+    net: number;
+    source: "broker" | "paper";
+  }> {
+    if (!this.isLiveMode()) {
+      return {
+        availableCash: 0,
+        net: 0,
+        source: "paper"
+      };
+    }
+    const { apiKey, accessToken } = this.credentials();
+    const baseUrl = this.cfg.baseUrl ?? "https://api.kite.trade";
+    const res = await fetch(`${baseUrl}/user/margins/equity`, {
+      headers: {
+        "X-Kite-Version": "3",
+        Authorization: `token ${apiKey}:${accessToken}`
+      }
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`fetchAvailableFunds failed ${res.status}: ${body}`);
+    }
+    const json = (await res.json()) as {
+      data?: {
+        available?: { cash?: number; live_balance?: number; opening_balance?: number };
+        net?: number;
+      };
+    };
+    const availableCash = Number(
+      json.data?.available?.cash ??
+        json.data?.available?.live_balance ??
+        json.data?.available?.opening_balance ??
+        0
+    );
+    const net = Number(json.data?.net ?? availableCash);
+    return {
+      availableCash: Number.isFinite(availableCash) ? availableCash : 0,
+      net: Number.isFinite(net) ? net : 0,
+      source: "broker"
+    };
+  }
+
   async fetchBrokerOrders(): Promise<
     Array<{
       orderId: string;

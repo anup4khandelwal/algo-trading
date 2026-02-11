@@ -68,6 +68,24 @@ Then login via:
 npm run ui
 ```
 
+## Modern React Dashboard
+Run API + React UI in two terminals:
+```bash
+# terminal 1 (API)
+npm run ui:api
+
+# terminal 2 (React dashboard)
+npm run ui:react
+```
+Open: `http://127.0.0.1:5173`
+
+To serve React from the same API server (`http://127.0.0.1:3000`), build it once:
+```bash
+npm run ui:react:build
+npm run ui
+```
+When `dashboard/dist/index.html` exists, `npm run ui` serves React UI by default.
+
 ## Core Commands
 - `npm run morning`: daily workflow (`db:check -> reconcile -> demo -> db:report`)
 - `npm run live`: intraday loop mode
@@ -89,9 +107,12 @@ Use these env controls before enabling live orders:
 - `CONFIRM_LIVE_ORDERS=YES`
 - `ALLOWED_SYMBOLS=...`
 - `MAX_NOTIONAL_PER_ORDER=...`
+- `STARTING_EQUITY=1000000` (paper-mode base equity)
+- `FUND_USAGE_PCT=0.95` (live: usable equity = available broker cash * this factor)
 - `KITE_ORDER_VARIETY=regular|amo`
 - `KITE_ENABLE_AMO_FALLBACK=1` (auto-retry AMO if broker returns `switch_to_amo`)
 - `HALT_TRADING=1` to pause entries immediately
+- `REJECT_GUARD_THRESHOLD=2` (auto-block symbol for the day after repeated broker rejects)
 - Optional Telegram alerts:
   - `TELEGRAM_BOT_TOKEN`
   - `TELEGRAM_CHAT_ID`
@@ -165,9 +186,35 @@ Thresholds:
 ## Broker Orderbook UI
 Dashboard includes **Broker Orderbook** (today scope):
 - live broker orders with `status`, `reason`, and action hints
-- filter: `All` / `Failed only`
+- advanced filters: `status`, `severity`, text search
 - manual refresh button
+- CSV export button
 - server-side cache for API protection (`BROKER_ORDERS_CACHE_MS`, default `30000`)
+
+## Manual Position Controls
+UI includes **Position Exit Console**:
+- exit partial position by percent
+- exit full position
+- update managed stop price
+
+## Safe Mode + Rejection Guard
+- Safe Mode (UI toggle) blocks morning entries and scheduler-start until disabled.
+- Safe Mode state is persisted in `system_state` and alert is sent via Telegram (if configured).
+- Rejection guard persists per-day reject counts and blocked symbols in `system_state` (`reject_guard_YYYY-MM-DD`).
+
+## Daily PnL + Exposure
+UI includes:
+- daily line chart from `daily_snapshots` for equity, realized PnL, unrealized PnL
+- current symbol exposure bars from open positions
+
+## Fund-Based Position Sizing
+- In live mode, app fetches broker funds (`/user/margins/equity`) and computes usable equity:
+  - `usableEquity = availableCash * FUND_USAGE_PCT`
+- Signal sizing and order placement use this usable equity.
+- During one run, app tracks remaining usable funds and skips entries that exceed remaining budget.
+- React dashboard shows:
+  - current `available cash` vs `usable equity`
+  - funds trend line chart from persisted `funds_history`
 
 ## Recommended Daily Runbook
 1. Refresh token (`npm run auth`) before market open.

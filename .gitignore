@@ -1,4 +1,5 @@
 node_modules
 /dist
+/dashboard/dist
 .env
 exports/backtest-latest.json

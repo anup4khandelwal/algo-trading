@@ -10,6 +10,9 @@
     "monitor": "npm run build && node -e \"import('./dist/pipeline.js').then(m => m.runMonitorPass())\"",
     "live": "npm run build && node dist/live/live_loop.js",
     "ui": "npm run build && node dist/ui/server.js",
+    "ui:api": "UI_PORT=3001 npm run ui",
+    "ui:react": "vite --config dashboard/vite.config.ts",
+    "ui:react:build": "vite build --config dashboard/vite.config.ts",
     "db:init": "npm run build && node dist/scripts/db_init.js",
     "db:check": "npm run build && node dist/scripts/db_check.js",
     "db:report": "npm run build && node dist/scripts/db_report.js",
@@ -28,14 +31,20 @@
     "start": "node dist/index.js"
   },
   "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
     "@types/node": "^22.10.2",
     "@types/pg": "^8.16.0",
+    "@vitejs/plugin-react": "^4.4.1",
     "dotenv": "^17.2.4",
     "ts-node": "^10.9.2",
     "tsx": "^4.21.0",
-    "typescript": "^5.7.3"
+    "typescript": "^5.7.3",
+    "vite": "^6.0.5"
   },
   "dependencies": {
-    "pg": "^8.18.0"
+    "pg": "^8.18.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
   }
 }

@@ -165,6 +165,102 @@ export async function runPreflightPass() {
   console.log("PREFLIGHT_OK", preflight);
 }
 
+export async function runManualPositionExit(
+  symbolRaw: string,
+  percentRaw = 100,
+  reason = "Manual UI exit"
+) {
+  dotenv.config();
+  const symbol = symbolRaw.trim().toUpperCase();
+  if (!symbol) {
+    throw new Error("symbol is required");
+  }
+  const runtime = await createRuntime();
+  const position = runtime.store.positions.get(symbol);
+  if (!position || position.qty <= 0) {
+    throw new Error(`No open long position for ${symbol}`);
+  }
+  const percent = Math.max(1, Math.min(100, Number(percentRaw)));
+  const qty = Math.max(1, Math.floor((position.qty * percent) / 100));
+  const closeQty = Math.min(position.qty, qty);
+  const intent: OrderIntent = {
+    idempotencyKey: `MANUAL-EXIT-${symbol}-${Date.now()}`,
+    symbol,
+    side: "SELL",
+    qty: closeQty,
+    type: "MARKET",
+    timeInForce: "DAY",
+    createdAt: new Date().toISOString(),
+    signalReason: reason
+  };
+  const order = await runtime.oms.createOrder(intent);
+  await runtime.oms.updateState(order.orderId, "OPEN");
+  const fill = await runtime.exec.placeOrder(order);
+  await runtime.oms.updateState(order.orderId, "FILLED", {
+    filledQty: fill.qty,
+    avgFillPrice: fill.price
+  });
+  await runtime.portfolio.applyFill(fill);
+  await runtime.persistence.closeTradeEntryLots(fill.symbol, fill.qty, fill.price, fill.time);
+
+  const after = runtime.store.positions.get(symbol);
+  const managed = await runtime.persistence.loadManagedPositions();
+  const managedRecord = managed.find((m) => m.symbol === symbol);
+  if (managedRecord) {
+    if (!after || after.qty <= 0) {
+      await runtime.persistence.deleteManagedPosition(symbol);
+    } else {
+      await runtime.persistence.upsertManagedPosition({
+        ...managedRecord,
+        qty: after.qty
+      });
+    }
+  }
+
+  await runtime.positionMonitor.reconcileWithPositions();
+  await persistDailySnapshot(runtime, "manual_exit");
+  return {
+    symbol,
+    requestedPercent: percent,
+    exitedQty: fill.qty,
+    exitPrice: fill.price,
+    remainingQty: after?.qty ?? 0
+  };
+}
+
+export async function runManualStopUpdate(symbolRaw: string, stopPriceRaw: number) {
+  dotenv.config();
+  const symbol = symbolRaw.trim().toUpperCase();
+  if (!symbol) {
+    throw new Error("symbol is required");
+  }
+  const stopPrice = Number(stopPriceRaw);
+  if (!Number.isFinite(stopPrice) || stopPrice <= 0) {
+    throw new Error("stopPrice must be a positive number");
+  }
+  const runtime = await createRuntime();
+  const position = runtime.store.positions.get(symbol);
+  if (!position || position.qty <= 0) {
+    throw new Error(`No open long position for ${symbol}`);
+  }
+  const managed = await runtime.persistence.loadManagedPositions();
+  const existing = managed.find((m) => m.symbol === symbol);
+  if (!existing) {
+    throw new Error(`No managed stop record for ${symbol}`);
+  }
+  await runtime.persistence.upsertManagedPosition({
+    ...existing,
+    stopPrice,
+    qty: position.qty
+  });
+  await persistDailySnapshot(runtime, "manual_stop_update");
+  return {
+    symbol,
+    qty: position.qty,
+    stopPrice
+  };
+}
+
 async function placeSignals(
   signals: Signal[],
   store: InMemoryStore,
@@ -177,16 +273,27 @@ async function placeSignals(
   alerter: ReturnType<typeof buildAlerter>
 ) {
   validateLiveModeSafety(exec);
+  const rejectGuardThreshold = Math.max(2, Number(process.env.REJECT_GUARD_THRESHOLD ?? "2"));
+  const rejectGuard = await loadRejectGuardState(persistence);
   const maxConsecutiveErrors = Number(process.env.MAX_CONSECUTIVE_ORDER_ERRORS ?? "3");
   const maxNotionalPerOrder = Number(process.env.MAX_NOTIONAL_PER_ORDER ?? "500000");
   const allowedSymbols = parseCsvSet(process.env.ALLOWED_SYMBOLS);
+  let remainingFunds = Math.max(0, store.equity);
   let consecutiveErrors = 0;
   for (const signal of signals) {
+    if (rejectGuard.blockedSymbols[signal.symbol]) {
+      console.log("SKIP", signal.symbol, "Blocked by reject guard for today");
+      continue;
+    }
     if (allowedSymbols && !allowedSymbols.has(signal.symbol)) {
       console.log("SKIP", signal.symbol, "Symbol not in ALLOWED_SYMBOLS");
       continue;
     }
     const notional = signal.qty * signal.entryPrice;
+    if (signal.side === "BUY" && notional > remainingFunds) {
+      console.log("SKIP", signal.symbol, "Insufficient remaining usable funds");
+      continue;
+    }
     if (notional > maxNotionalPerOrder) {
       console.log("SKIP", signal.symbol, "Max notional per order breached");
       continue;
@@ -225,11 +332,39 @@ async function placeSignals(
 
       await portfolio.applyFill(fill);
       await positionMonitor.trackEntry(fill, signal);
+      if (fill.side === "BUY") {
+        remainingFunds = Math.max(0, remainingFunds - fill.qty * fill.price);
+      } else {
+        remainingFunds += fill.qty * fill.price;
+      }
       console.log("FILLED", fill.symbol, fill.qty, fill.price.toFixed(2));
       consecutiveErrors = 0;
     } catch (err) {
       consecutiveErrors += 1;
       console.error("ORDER_ERROR", signal.symbol, err);
+      const message = err instanceof Error ? err.message : String(err);
+      if (isBrokerRejectError(message)) {
+        const now = new Date().toISOString();
+        const next = (rejectGuard.rejectCounts[signal.symbol] ?? 0) + 1;
+        rejectGuard.rejectCounts[signal.symbol] = next;
+        if (next >= rejectGuardThreshold && !rejectGuard.blockedSymbols[signal.symbol]) {
+          rejectGuard.blockedSymbols[signal.symbol] = {
+            blockedAt: now,
+            reason: message.slice(0, 240),
+            count: next
+          };
+          await alerter.notify(
+            "warning",
+            "symbol_reject_guard_blocked",
+            `Reject guard blocked ${signal.symbol} for the day`,
+            {
+              symbol: signal.symbol,
+              count: next
+            }
+          );
+        }
+        await saveRejectGuardState(persistence, rejectGuard);
+      }
       await alerter.notify(
         "critical",
         "order_error",
@@ -269,6 +404,7 @@ async function runMonitorCycles(positionMonitor: PositionMonitor) {
 
 async function createRuntime() {
   const store = new InMemoryStore();
+  store.equity = Number(process.env.STARTING_EQUITY ?? "1000000");
   const persistence = await buildPersistence();
   for (const position of await persistence.loadPositions()) {
     store.positions.set(position.symbol, position);
@@ -314,6 +450,37 @@ async function createRuntime() {
   );
   await positionMonitor.hydrate();
   const alerter = buildAlerter(persistence);
+
+  const fundUsagePct = clamp01(Number(process.env.FUND_USAGE_PCT ?? "0.95"));
+  let fundSource: "broker" | "paper" = "paper";
+  let availableCash = store.equity;
+  if (exec.isLiveMode()) {
+    try {
+      const funds = await exec.fetchAvailableFunds();
+      fundSource = funds.source;
+      availableCash = Math.max(0, funds.availableCash);
+      store.equity = Math.max(0, availableCash * fundUsagePct);
+    } catch (err) {
+      console.warn("LIVE_FUNDS_FETCH_FAIL", err);
+    }
+  }
+  await persistence.upsertSystemState(
+    "last_available_funds",
+    JSON.stringify({
+      availableCash,
+      usableEquity: store.equity,
+      fundUsagePct,
+      source: fundSource,
+      updatedAt: new Date().toISOString()
+    })
+  );
+  await appendFundsHistory(persistence, {
+    ts: new Date().toISOString(),
+    availableCash,
+    usableEquity: store.equity,
+    source: fundSource
+  });
+
   if (exec.isLiveMode()) {
     await exec.reconcileBrokerPositions(store, persistence);
     await persistence.upsertSystemState("last_broker_sync_at", new Date().toISOString());
@@ -411,6 +578,96 @@ function parseCsvSet(value: string | undefined): Set<string> | null {
       .map((x) => x.trim().toUpperCase())
       .filter((x) => x.length > 0)
   );
+}
+
+function clamp01(value: number) {
+  if (!Number.isFinite(value)) {
+    return 0.95;
+  }
+  return Math.max(0, Math.min(1, value));
+}
+
+function isBrokerRejectError(message: string): boolean {
+  const msg = message.toLowerCase();
+  return (
+    msg.includes("rejected") ||
+    msg.includes("inputexception") ||
+    msg.includes("rms") ||
+    msg.includes("could not be converted") ||
+    msg.includes("freeze quantity")
+  );
+}
+
+type RejectGuardState = {
+  tradeDate: string;
+  rejectCounts: Record<string, number>;
+  blockedSymbols: Record<string, { blockedAt: string; reason: string; count: number }>;
+};
+
+async function loadRejectGuardState(
+  persistence: Awaited<ReturnType<typeof buildPersistence>>
+): Promise<RejectGuardState> {
+  const tradeDate = getTradeDateIST();
+  const key = `reject_guard_${tradeDate}`;
+  const raw = await persistence.loadSystemState(key);
+  if (!raw) {
+    return { tradeDate, rejectCounts: {}, blockedSymbols: {} };
+  }
+  try {
+    const parsed = JSON.parse(raw) as Partial<RejectGuardState>;
+    return {
+      tradeDate,
+      rejectCounts: parsed.rejectCounts ?? {},
+      blockedSymbols: parsed.blockedSymbols ?? {}
+    };
+  } catch {
+    return { tradeDate, rejectCounts: {}, blockedSymbols: {} };
+  }
+}
+
+async function saveRejectGuardState(
+  persistence: Awaited<ReturnType<typeof buildPersistence>>,
+  state: RejectGuardState
+) {
+  await persistence.upsertSystemState(`reject_guard_${state.tradeDate}`, JSON.stringify(state));
+}
+
+type FundsHistoryPoint = {
+  ts: string;
+  availableCash: number;
+  usableEquity: number;
+  source: "broker" | "paper";
+};
+
+async function appendFundsHistory(
+  persistence: Awaited<ReturnType<typeof buildPersistence>>,
+  point: FundsHistoryPoint
+) {
+  const key = "funds_history";
+  const raw = await persistence.loadSystemState(key);
+  let rows: FundsHistoryPoint[] = [];
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw) as FundsHistoryPoint[];
+      rows = Array.isArray(parsed) ? parsed : [];
+    } catch {
+      rows = [];
+    }
+  }
+  const last = rows[rows.length - 1];
+  const changed =
+    !last ||
+    Math.abs(Number(last.availableCash ?? 0) - point.availableCash) > 1 ||
+    Math.abs(Number(last.usableEquity ?? 0) - point.usableEquity) > 1 ||
+    last.source !== point.source;
+  if (!changed) {
+    return;
+  }
+  rows.push(point);
+  if (rows.length > 500) {
+    rows = rows.slice(rows.length - 500);
+  }
+  await persistence.upsertSystemState(key, JSON.stringify(rows));
 }
 
 function hasDuplicateOrderForToday(store: InMemoryStore, symbol: string): boolean {

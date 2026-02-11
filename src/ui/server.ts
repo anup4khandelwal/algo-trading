@@ -1,21 +1,30 @@
 import http from "node:http";
+import path from "node:path";
+import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import dotenv from "dotenv";
 import { Pool } from "pg";
 import {
   runEodClosePass,
+  runManualPositionExit,
+  runManualStopUpdate,
   runMonitorPass,
   runMorningWorkflow,
   runPreflightPass
 } from "../pipeline.js";
 import { PostgresPersistence } from "../persistence/postgres_persistence.js";
+import { NoopPersistence } from "../persistence/persistence.js";
 import { runConfiguredBacktest } from "../backtest/service.js";
 import { TradingScheduler } from "../ops/scheduler.js";
 import { ZerodhaAdapter } from "../execution/zerodha_adapter.js";
 import { MapLtpProvider } from "../market_data/ltp_provider.js";
+import { buildAlerter } from "../ops/alerter.js";
 
 dotenv.config();
 
 const PORT = Number(process.env.UI_PORT ?? "3000");
+const REACT_DIST_DIR = path.resolve(process.cwd(), "dashboard", "dist");
+const HAS_REACT_BUILD = existsSync(path.join(REACT_DIST_DIR, "index.html"));
 type UiJob = "morning" | "monitor" | "preflight" | "backtest" | "eod_close";
 type BrokerOrdersReport = {
   enabled: boolean;
@@ -28,12 +37,30 @@ type BrokerOrdersReport = {
     open: number;
     rejected: number;
     cancelled: number;
+    filtered: number;
   };
   orders: Array<Record<string, unknown>>;
+};
+type SafeModeState = {
+  enabled: boolean;
+  reason: string;
+  updatedAt: string;
+  source: string;
+};
+type BrokerOrderFilter = {
+  status: "all" | "failed" | "open" | "complete" | "cancelled" | "rejected";
+  severity: "all" | "critical" | "warning" | "info";
+  search: string;
 };
 let runningJob: UiJob | null = null;
 let lastDbErrorLogAt = 0;
 const runtimeErrors: Array<{ time: string; source: string; message: string }> = [];
+let safeModeState: SafeModeState = {
+  enabled: process.env.HALT_TRADING === "1",
+  reason: process.env.HALT_TRADING === "1" ? "set from env" : "",
+  updatedAt: new Date().toISOString(),
+  source: "env"
+};
 let brokerOrdersCache:
   | {
       fetchedAtMs: number;
@@ -60,11 +87,19 @@ const scheduler = new TradingScheduler(
 if (process.env.SCHEDULER_ENABLED === "1") {
   scheduler.start();
 }
+void hydrateSafeModeFromDb();
 
 const server = http.createServer(async (req, res) => {
   try {
     const method = req.method ?? "GET";
     const url = new URL(req.url ?? "/", `http://127.0.0.1:${PORT}`);
+
+    if (method === "GET" && !url.pathname.startsWith("/api")) {
+      const served = await tryServeReactApp(url.pathname, res);
+      if (served) {
+        return;
+      }
+    }
 
     if (method === "GET" && url.pathname === "/") {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
@@ -78,6 +113,7 @@ const server = http.createServer(async (req, res) => {
         runningJob,
         liveMode: process.env.LIVE_ORDER_MODE === "1",
         lastPreflight: report.lastPreflight ?? null,
+        safeMode: getSafeModeState(),
         scheduler: scheduler.getState()
       });
       return;
@@ -105,8 +141,40 @@ const server = http.createServer(async (req, res) => {
 
     if (method === "GET" && url.pathname === "/api/broker/orders") {
       const refresh = url.searchParams.get("refresh") === "1";
-      const brokerOrders = await getBrokerOrdersReport(refresh);
+      const brokerOrders = await getBrokerOrdersReport(refresh, parseBrokerOrderFilter(url));
       json(res, 200, brokerOrders);
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/api/broker/orders.csv") {
+      const refresh = url.searchParams.get("refresh") === "1";
+      const brokerOrders = await getBrokerOrdersReport(refresh, parseBrokerOrderFilter(url));
+      const csv = toCsv(
+        brokerOrders.orders,
+        [
+          "updatedAt",
+          "orderId",
+          "symbol",
+          "side",
+          "qty",
+          "filledQty",
+          "cancelledQty",
+          "status",
+          "product",
+          "exchange",
+          "validity",
+          "averagePrice",
+          "severity",
+          "hintCode",
+          "hintText",
+          "reason"
+        ]
+      );
+      res.writeHead(200, {
+        "Content-Type": "text/csv; charset=utf-8",
+        "Content-Disposition": `attachment; filename="broker-orders-${new Date().toISOString().slice(0, 10)}.csv"`
+      });
+      res.end(csv);
       return;
     }
 
@@ -170,6 +238,10 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (method === "POST" && url.pathname === "/api/scheduler/start") {
+      if (getSafeModeState().enabled) {
+        json(res, 409, { error: "Safe Mode is enabled. Disable it before starting scheduler." });
+        return;
+      }
       scheduler.start();
       json(res, 200, { ok: true, scheduler: scheduler.getState() });
       return;
@@ -178,6 +250,27 @@ const server = http.createServer(async (req, res) => {
     if (method === "POST" && url.pathname === "/api/scheduler/stop") {
       scheduler.stop();
       json(res, 200, { ok: true, scheduler: scheduler.getState() });
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/api/safe-mode") {
+      json(res, 200, { safeMode: getSafeModeState(), scheduler: scheduler.getState() });
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/api/safe-mode/enable") {
+      const body = await readJsonBody(req);
+      const reason = String(body?.reason ?? "manual ui toggle").trim();
+      await setSafeMode(true, reason || "manual ui toggle", "ui");
+      json(res, 200, { ok: true, safeMode: getSafeModeState(), scheduler: scheduler.getState() });
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/api/safe-mode/disable") {
+      const body = await readJsonBody(req);
+      const reason = String(body?.reason ?? "manual ui toggle").trim();
+      await setSafeMode(false, reason || "manual ui toggle", "ui");
+      json(res, 200, { ok: true, safeMode: getSafeModeState(), scheduler: scheduler.getState() });
       return;
     }
 
@@ -218,6 +311,33 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (method === "POST" && url.pathname === "/api/position/exit") {
+      const body = await readJsonBody(req);
+      const symbol = String(body?.symbol ?? "").trim().toUpperCase();
+      const percent = Number(body?.percent ?? 100);
+      const reason = String(body?.reason ?? "Manual UI exit");
+      if (!symbol) {
+        json(res, 400, { error: "symbol is required" });
+        return;
+      }
+      const result = await runManualPositionExit(symbol, percent, reason);
+      json(res, 200, { ok: true, result });
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/api/position/stop") {
+      const body = await readJsonBody(req);
+      const symbol = String(body?.symbol ?? "").trim().toUpperCase();
+      const stopPrice = Number(body?.stopPrice);
+      if (!symbol || !Number.isFinite(stopPrice) || stopPrice <= 0) {
+        json(res, 400, { error: "symbol and positive stopPrice are required" });
+        return;
+      }
+      const result = await runManualStopUpdate(symbol, stopPrice);
+      json(res, 200, { ok: true, result });
+      return;
+    }
+
     json(res, 404, { error: "Not found" });
   } catch (err) {
     console.error(err);
@@ -230,7 +350,139 @@ server.listen(PORT, "127.0.0.1", () => {
   if (scheduler.isRunning()) {
     console.log("SCHEDULER_ENABLED: started");
   }
+  if (HAS_REACT_BUILD) {
+    console.log("Serving React dashboard from dashboard/dist");
+  }
 });
+
+async function tryServeReactApp(pathname: string, res: http.ServerResponse) {
+  if (!HAS_REACT_BUILD) {
+    return false;
+  }
+  const safePath = pathname === "/" ? "/index.html" : pathname;
+  const candidate = path.resolve(REACT_DIST_DIR, `.${safePath}`);
+  if (!candidate.startsWith(REACT_DIST_DIR)) {
+    return false;
+  }
+
+  if (existsSync(candidate) && !candidate.endsWith(path.sep)) {
+    const body = await readFile(candidate);
+    res.writeHead(200, { "Content-Type": contentTypeForPath(candidate) });
+    res.end(body);
+    return true;
+  }
+
+  if (!path.basename(pathname).includes(".")) {
+    const indexPath = path.join(REACT_DIST_DIR, "index.html");
+    if (existsSync(indexPath)) {
+      const body = await readFile(indexPath);
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(body);
+      return true;
+    }
+  }
+  return false;
+}
+
+function contentTypeForPath(filePath: string) {
+  if (filePath.endsWith(".html")) return "text/html; charset=utf-8";
+  if (filePath.endsWith(".js")) return "application/javascript; charset=utf-8";
+  if (filePath.endsWith(".css")) return "text/css; charset=utf-8";
+  if (filePath.endsWith(".svg")) return "image/svg+xml";
+  if (filePath.endsWith(".json")) return "application/json; charset=utf-8";
+  if (filePath.endsWith(".ico")) return "image/x-icon";
+  if (filePath.endsWith(".png")) return "image/png";
+  return "application/octet-stream";
+}
+
+async function hydrateSafeModeFromDb() {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) {
+    process.env.HALT_TRADING = safeModeState.enabled ? "1" : "0";
+    return;
+  }
+  const persistence = new PostgresPersistence(databaseUrl);
+  try {
+    await persistence.init();
+    const raw = await persistence.loadSystemState("safe_mode");
+    if (!raw) {
+      process.env.HALT_TRADING = safeModeState.enabled ? "1" : "0";
+      return;
+    }
+    const parsed = JSON.parse(raw) as Partial<SafeModeState>;
+    safeModeState = {
+      enabled: parsed.enabled === true,
+      reason: String(parsed.reason ?? ""),
+      updatedAt: String(parsed.updatedAt ?? new Date().toISOString()),
+      source: String(parsed.source ?? "db")
+    };
+    process.env.HALT_TRADING = safeModeState.enabled ? "1" : "0";
+  } catch (err) {
+    pushRuntimeError("SAFE_MODE_HYDRATE", err);
+  }
+}
+
+function getSafeModeState(): SafeModeState {
+  return { ...safeModeState };
+}
+
+async function setSafeMode(enabled: boolean, reason: string, source: string) {
+  safeModeState = {
+    enabled,
+    reason,
+    updatedAt: new Date().toISOString(),
+    source
+  };
+  process.env.HALT_TRADING = enabled ? "1" : "0";
+  if (enabled) {
+    scheduler.stop();
+  }
+  await persistSafeModeState(safeModeState);
+  await notifySafeModeChange(safeModeState);
+}
+
+async function persistSafeModeState(state: SafeModeState) {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) {
+    return;
+  }
+  const persistence = new PostgresPersistence(databaseUrl);
+  try {
+    await persistence.init();
+    await persistence.upsertSystemState("safe_mode", JSON.stringify(state));
+  } catch (err) {
+    pushRuntimeError("SAFE_MODE_PERSIST", err);
+  }
+}
+
+async function notifySafeModeChange(state: SafeModeState) {
+  const databaseUrl = process.env.DATABASE_URL;
+  let persistence: PostgresPersistence | NoopPersistence = new NoopPersistence();
+  if (databaseUrl) {
+    const pg = new PostgresPersistence(databaseUrl);
+    try {
+      await pg.init();
+      persistence = pg;
+    } catch {
+      persistence = new NoopPersistence();
+    }
+  }
+  try {
+    const alerter = buildAlerter(persistence);
+    await alerter.notify(
+      state.enabled ? "warning" : "info",
+      "safe_mode_toggled",
+      state.enabled ? "Safe Mode enabled" : "Safe Mode disabled",
+      {
+        reason: state.reason,
+        source: state.source,
+        updatedAt: state.updatedAt
+      }
+    );
+  } catch (err) {
+    pushRuntimeError("SAFE_MODE_ALERT", err);
+  }
+}
 
 function json(res: http.ServerResponse, status: number, body: unknown) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
@@ -245,6 +497,10 @@ function launchJob(
 ) {
   if (runningJob) {
     json(res, 409, { error: `Job already running: ${runningJob}` });
+    return false;
+  }
+  if (job === "morning" && getSafeModeState().enabled) {
+    json(res, 409, { error: "Safe Mode is enabled. Disable it before running Morning job." });
     return false;
   }
   void runUiJob(job, logTag, runner).catch(() => {
@@ -291,6 +547,10 @@ async function getDbReport() {
       fills: [],
       positions: [],
       managedPositions: [],
+      dailySnapshots: [],
+      rejectGuard: { tradeDate: getIstTradeDate(), rejectCounts: {}, blockedSymbols: {} },
+      funds: null,
+      fundsHistory: [],
       lastBrokerSyncAt: null,
       lastPreflight: null,
       latestAlerts: [],
@@ -300,7 +560,7 @@ async function getDbReport() {
 
   const pool = new Pool({ connectionString: databaseUrl });
   try {
-    const [orders, fills, positions, managed] = await Promise.all([
+    const [orders, fills, positions, managed, dailySnapshots] = await Promise.all([
       pool.query(
         `
         SELECT order_id, symbol, side, qty, state, avg_fill_price, updated_at
@@ -330,6 +590,14 @@ async function getDbReport() {
         FROM managed_positions
         ORDER BY symbol
         `
+      ),
+      pool.query(
+        `
+        SELECT trade_date, equity, realized_pnl, unrealized_pnl, open_positions, note, created_at
+        FROM daily_snapshots
+        ORDER BY trade_date DESC
+        LIMIT 120
+        `
       )
     ]);
 
@@ -339,10 +607,87 @@ async function getDbReport() {
     const stateRows =
       systemStateTable.rows[0]?.exists
         ? await pool.query<{ key: string; value: string }>(
-            `SELECT key, value FROM system_state WHERE key IN ('last_broker_sync_at', 'last_preflight')`
+            `SELECT key, value FROM system_state WHERE key IN ('last_broker_sync_at', 'last_preflight', 'last_available_funds', 'funds_history', $1)`,
+            [`reject_guard_${getIstTradeDate()}`]
           )
         : { rows: [] as Array<{ key: string; value: string }> };
     const stateMap = new Map(stateRows.rows.map((r) => [r.key, r.value]));
+    const fundsRaw = stateMap.get("last_available_funds");
+    let funds: {
+      availableCash: number;
+      usableEquity: number;
+      fundUsagePct: number;
+      source: string;
+      updatedAt: string;
+    } | null = null;
+    if (fundsRaw) {
+      try {
+        const parsed = JSON.parse(fundsRaw) as Partial<{
+          availableCash: number;
+          usableEquity: number;
+          fundUsagePct: number;
+          source: string;
+          updatedAt: string;
+        }>;
+        funds = {
+          availableCash: Number(parsed.availableCash ?? 0),
+          usableEquity: Number(parsed.usableEquity ?? 0),
+          fundUsagePct: Number(parsed.fundUsagePct ?? 0),
+          source: String(parsed.source ?? "unknown"),
+          updatedAt: String(parsed.updatedAt ?? "")
+        };
+      } catch {
+        funds = null;
+      }
+    }
+    const fundsHistoryRaw = stateMap.get("funds_history");
+    let fundsHistory: Array<{
+      ts: string;
+      availableCash: number;
+      usableEquity: number;
+      source: string;
+    }> = [];
+    if (fundsHistoryRaw) {
+      try {
+        const parsed = JSON.parse(fundsHistoryRaw) as Array<{
+          ts?: string;
+          availableCash?: number;
+          usableEquity?: number;
+          source?: string;
+        }>;
+        fundsHistory = Array.isArray(parsed)
+          ? parsed
+              .map((x) => ({
+                ts: String(x.ts ?? ""),
+                availableCash: Number(x.availableCash ?? 0),
+                usableEquity: Number(x.usableEquity ?? 0),
+                source: String(x.source ?? "unknown")
+              }))
+              .filter((x) => x.ts.length > 0)
+              .slice(-200)
+          : [];
+      } catch {
+        fundsHistory = [];
+      }
+    }
+    const rejectGuardRaw = stateMap.get(`reject_guard_${getIstTradeDate()}`);
+    let rejectGuard: {
+      tradeDate: string;
+      rejectCounts: Record<string, number>;
+      blockedSymbols: Record<string, { blockedAt: string; reason: string; count: number }>;
+    } = { tradeDate: getIstTradeDate(), rejectCounts: {}, blockedSymbols: {} };
+    if (rejectGuardRaw) {
+      try {
+        const parsed = JSON.parse(rejectGuardRaw) as Partial<typeof rejectGuard>;
+        rejectGuard = {
+          tradeDate: parsed.tradeDate ?? getIstTradeDate(),
+          rejectCounts: parsed.rejectCounts ?? {},
+          blockedSymbols: parsed.blockedSymbols ?? {}
+        };
+      } catch {
+        rejectGuard = { tradeDate: getIstTradeDate(), rejectCounts: {}, blockedSymbols: {} };
+      }
+    }
 
     const alertsTable = await pool.query<{ exists: string | null }>(
       `SELECT to_regclass('public.alert_events') AS exists`
@@ -379,6 +724,10 @@ async function getDbReport() {
       fills: fills.rows,
       positions: positions.rows,
       managedPositions: managed.rows,
+      dailySnapshots: dailySnapshots.rows,
+      rejectGuard,
+      funds,
+      fundsHistory,
       lastBrokerSyncAt: stateMap.get("last_broker_sync_at") ?? null,
       lastPreflight: stateMap.get("last_preflight") ?? null,
       latestAlerts: latestAlerts.rows,
@@ -393,6 +742,10 @@ async function getDbReport() {
       fills: [],
       positions: [],
       managedPositions: [],
+      dailySnapshots: [],
+      rejectGuard: { tradeDate: getIstTradeDate(), rejectCounts: {}, blockedSymbols: {} },
+      funds: null,
+      fundsHistory: [],
       lastBrokerSyncAt: null,
       lastPreflight: null,
       latestAlerts: [],
@@ -682,6 +1035,7 @@ async function getHealthReport() {
   const broker = await checkBrokerHealth();
   const schedulerState = scheduler.getState();
   const token = getTokenLifetimeEstimate();
+  const funds = await loadFundsState(databaseUrl);
 
   let latestAlertErrors: Array<{ time: string; type: string; message: string }> = [];
   if (databaseUrl) {
@@ -737,6 +1091,8 @@ async function getHealthReport() {
     db,
     broker,
     token,
+    funds,
+    safeMode: getSafeModeState(),
     scheduler: {
       enabled: schedulerState.enabled,
       lastRuns: schedulerState.lastRuns
@@ -745,10 +1101,47 @@ async function getHealthReport() {
   };
 }
 
-async function getBrokerOrdersReport(forceRefresh = false): Promise<BrokerOrdersReport> {
+async function loadFundsState(databaseUrl: string | undefined) {
+  if (!databaseUrl) {
+    return null;
+  }
+  const pool = new Pool({ connectionString: databaseUrl });
+  try {
+    const state = await pool.query<{ value: string }>(
+      `SELECT value FROM system_state WHERE key = 'last_available_funds' LIMIT 1`
+    );
+    const raw = state.rows[0]?.value;
+    if (!raw) {
+      return null;
+    }
+    const parsed = JSON.parse(raw) as Partial<{
+      availableCash: number;
+      usableEquity: number;
+      fundUsagePct: number;
+      source: string;
+      updatedAt: string;
+    }>;
+    return {
+      availableCash: Number(parsed.availableCash ?? 0),
+      usableEquity: Number(parsed.usableEquity ?? 0),
+      fundUsagePct: Number(parsed.fundUsagePct ?? 0),
+      source: String(parsed.source ?? "unknown"),
+      updatedAt: String(parsed.updatedAt ?? "")
+    };
+  } catch {
+    return null;
+  } finally {
+    await pool.end();
+  }
+}
+
+async function getBrokerOrdersReport(
+  forceRefresh = false,
+  filter: BrokerOrderFilter = { status: "all", severity: "all", search: "" }
+): Promise<BrokerOrdersReport> {
   const ttlMs = Number(process.env.BROKER_ORDERS_CACHE_MS ?? "30000");
   if (!forceRefresh && brokerOrdersCache && Date.now() - brokerOrdersCache.fetchedAtMs < ttlMs) {
-    return brokerOrdersCache.data;
+    return withBrokerOrderFilter(brokerOrdersCache.data, filter);
   }
 
   if (process.env.LIVE_ORDER_MODE !== "1") {
@@ -757,11 +1150,11 @@ async function getBrokerOrdersReport(forceRefresh = false): Promise<BrokerOrders
       stale: false,
       fetchedAt: new Date().toISOString(),
       message: "Broker orders are available only in live mode.",
-      stats: { total: 0, complete: 0, open: 0, rejected: 0, cancelled: 0 },
+      stats: { total: 0, complete: 0, open: 0, rejected: 0, cancelled: 0, filtered: 0 },
       orders: [] as Array<Record<string, unknown>>
     };
     brokerOrdersCache = { fetchedAtMs: Date.now(), data };
-    return data;
+    return withBrokerOrderFilter(data, filter);
   }
 
   const apiKey = process.env.KITE_API_KEY;
@@ -772,11 +1165,11 @@ async function getBrokerOrdersReport(forceRefresh = false): Promise<BrokerOrders
       stale: false,
       fetchedAt: new Date().toISOString(),
       message: "KITE_API_KEY or KITE_ACCESS_TOKEN is missing.",
-      stats: { total: 0, complete: 0, open: 0, rejected: 0, cancelled: 0 },
+      stats: { total: 0, complete: 0, open: 0, rejected: 0, cancelled: 0, filtered: 0 },
       orders: [] as Array<Record<string, unknown>>
     };
     brokerOrdersCache = { fetchedAtMs: Date.now(), data };
-    return data;
+    return withBrokerOrderFilter(data, filter);
   }
 
   try {
@@ -821,7 +1214,8 @@ async function getBrokerOrdersReport(forceRefresh = false): Promise<BrokerOrders
       complete: orders.filter((o) => o.status === "COMPLETE").length,
       open: orders.filter((o) => ["OPEN", "TRIGGER PENDING", "MODIFY VALIDATION PENDING"].includes(o.status)).length,
       rejected: orders.filter((o) => o.status === "REJECTED").length,
-      cancelled: orders.filter((o) => o.status === "CANCELLED").length
+      cancelled: orders.filter((o) => o.status === "CANCELLED").length,
+      filtered: orders.length
     };
     const data = {
       enabled: true,
@@ -832,22 +1226,23 @@ async function getBrokerOrdersReport(forceRefresh = false): Promise<BrokerOrders
       orders
     };
     brokerOrdersCache = { fetchedAtMs: Date.now(), data };
-    return data;
+    return withBrokerOrderFilter(data, filter);
   } catch (err) {
     pushRuntimeError("BROKER_ORDERS", err);
     if (brokerOrdersCache) {
-      return {
+      const cached = {
         ...brokerOrdersCache.data,
         stale: true,
         message: `Broker API unavailable. Showing cached data. ${err instanceof Error ? err.message : String(err)}`
       };
+      return withBrokerOrderFilter(cached, filter);
     }
     return {
       enabled: false,
       stale: false,
       fetchedAt: new Date().toISOString(),
       message: err instanceof Error ? err.message : String(err),
-      stats: { total: 0, complete: 0, open: 0, rejected: 0, cancelled: 0 },
+      stats: { total: 0, complete: 0, open: 0, rejected: 0, cancelled: 0, filtered: 0 },
       orders: [] as Array<Record<string, unknown>>
     };
   }
@@ -1042,6 +1437,87 @@ function toIstDate(input: string) {
   return getIstTradeDate(date);
 }
 
+function parseBrokerOrderFilter(url: URL): BrokerOrderFilter {
+  const statusRaw = String(url.searchParams.get("status") ?? "all").toLowerCase();
+  const severityRaw = String(url.searchParams.get("severity") ?? "all").toLowerCase();
+  const search = String(url.searchParams.get("search") ?? "").trim().toLowerCase();
+  const statusAllowed = new Set(["all", "failed", "open", "complete", "cancelled", "rejected"]);
+  const severityAllowed = new Set(["all", "critical", "warning", "info"]);
+  return {
+    status: statusAllowed.has(statusRaw) ? (statusRaw as BrokerOrderFilter["status"]) : "all",
+    severity: severityAllowed.has(severityRaw)
+      ? (severityRaw as BrokerOrderFilter["severity"])
+      : "all",
+    search
+  };
+}
+
+function withBrokerOrderFilter(report: BrokerOrdersReport, filter: BrokerOrderFilter): BrokerOrdersReport {
+  const rows = report.orders.filter((row) => matchBrokerOrder(row, filter));
+  return {
+    ...report,
+    stats: {
+      ...report.stats,
+      filtered: rows.length
+    },
+    orders: rows
+  };
+}
+
+function matchBrokerOrder(row: Record<string, unknown>, filter: BrokerOrderFilter): boolean {
+  const status = String(row.status ?? "").toUpperCase();
+  const severity = String(row.severity ?? "info").toLowerCase();
+  if (filter.status === "failed" && !["REJECTED", "CANCELLED"].includes(status)) {
+    return false;
+  }
+  if (filter.status === "open" && !["OPEN", "TRIGGER PENDING", "MODIFY VALIDATION PENDING"].includes(status)) {
+    return false;
+  }
+  if (filter.status === "complete" && status !== "COMPLETE") {
+    return false;
+  }
+  if (filter.status === "cancelled" && status !== "CANCELLED") {
+    return false;
+  }
+  if (filter.status === "rejected" && status !== "REJECTED") {
+    return false;
+  }
+  if (filter.severity !== "all" && severity !== filter.severity) {
+    return false;
+  }
+  if (filter.search.length > 0) {
+    const hay = [
+      row.orderId,
+      row.symbol,
+      row.status,
+      row.side,
+      row.reason,
+      row.hintText,
+      row.hintCode
+    ]
+      .map((x) => String(x ?? "").toLowerCase())
+      .join(" ");
+    if (!hay.includes(filter.search)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function toCsv(rows: Array<Record<string, unknown>>, columns: string[]) {
+  const head = columns.join(",");
+  const body = rows.map((row) => columns.map((col) => csvEscape(row[col])).join(",")).join("\n");
+  return `${head}\n${body}\n`;
+}
+
+function csvEscape(value: unknown) {
+  const raw = String(value ?? "");
+  if (!raw.includes(",") && !raw.includes('"') && !raw.includes("\n")) {
+    return raw;
+  }
+  return `"${raw.replaceAll('"', '""')}"`;
+}
+
 function summarizeBySymbol(rows: { symbol: string; pnl: number; rMultiple: number }[]) {
   const map = new Map<
     string,
@@ -1216,21 +1692,22 @@ function htmlPage() {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Swing Control Center</title>
+  <title>SwingTrader Dashboard</title>
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
     :root {
-      --bg0: #f3f9f4;
-      --bg1: #e6f3e8;
-      --ink: #14201a;
-      --muted: #53665b;
-      --card: rgba(255,255,255,0.86);
-      --line: #c8d8cc;
-      --brand: #0a7a4e;
-      --brand-ink: #e8fff2;
-      --warn: #9f4f00;
-      --good: #0a7a4e;
-      --danger: #9a1b1b;
+      --bg0: #f2f7f7;
+      --bg1: #e8f0f4;
+      --ink: #0f1e2f;
+      --muted: #5b697c;
+      --card: rgba(255, 255, 255, 0.92);
+      --line: #d5dfeb;
+      --brand: #0e7f57;
+      --brand-ink: #e8fff4;
+      --warn: #a86400;
+      --good: #0e7f57;
+      --danger: #b42318;
+      --shadow: 0 8px 24px rgba(14, 30, 47, 0.08);
     }
     * { box-sizing: border-box; }
     body {
@@ -1238,47 +1715,52 @@ function htmlPage() {
       font-family: "Space Grotesk", "Trebuchet MS", sans-serif;
       color: var(--ink);
       background:
-        radial-gradient(800px 420px at 85% -20%, #d5f7e3 0%, transparent 60%),
-        radial-gradient(520px 300px at -5% 30%, #dff7e8 0%, transparent 60%),
+        radial-gradient(860px 420px at 90% -10%, #dff3ff 0%, transparent 60%),
+        radial-gradient(620px 360px at -5% 25%, #e7fff1 0%, transparent 58%),
         linear-gradient(135deg, var(--bg0), var(--bg1));
       min-height: 100vh;
     }
-    .wrap { max-width: 1220px; margin: 0 auto; padding: 28px 18px 40px; }
+    .wrap { max-width: 1360px; margin: 0 auto; padding: 24px 18px 46px; }
     .hero {
-      background: linear-gradient(135deg, #0c5d3f, #108c5a);
-      color: #e9fff3;
-      border-radius: 18px;
-      padding: 18px;
+      background:
+        radial-gradient(380px 160px at 18% -10%, rgba(255,255,255,0.2), transparent 64%),
+        linear-gradient(135deg, #0f5f88, #0e7f57);
+      color: #eef7ff;
+      border-radius: 22px;
+      padding: 20px;
       display: grid;
       gap: 14px;
-      box-shadow: 0 12px 30px rgba(9, 73, 48, 0.28);
-      animation: rise 420ms ease-out;
+      box-shadow: 0 18px 34px rgba(13, 62, 92, 0.25);
+      animation: rise 380ms ease-out;
     }
     .hero-top { display:flex; justify-content:space-between; align-items:flex-start; gap: 12px; flex-wrap: wrap; }
-    .hero-title { margin: 0; font-size: 28px; letter-spacing: 0.2px; }
-    .hero-sub { margin: 4px 0 0; color: #c8f8dc; font-size: 13px; }
-    .hero-meta { margin-top: 4px; color: #dafbe8; font-size: 12px; }
-    .toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+    .hero-title { margin: 0; font-size: 30px; letter-spacing: 0.1px; }
+    .hero-sub { margin: 4px 0 0; color: #d7f0ff; font-size: 13px; }
+    .hero-meta { margin-top: 4px; color: #cde8ff; font-size: 12px; }
+    .toolbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
     button {
-      border: 1px solid rgba(255,255,255,0.2);
+      border: 1px solid var(--line);
       border-radius: 10px;
-      padding: 10px 14px;
+      padding: 9px 13px;
       cursor: pointer;
       font-weight: 700;
       letter-spacing: 0.15px;
       font-family: "Space Grotesk", "Trebuchet MS", sans-serif;
-      transition: transform 140ms ease, opacity 140ms ease;
+      transition: transform 140ms ease, opacity 140ms ease, box-shadow 140ms ease, background 140ms ease;
     }
     button:active { transform: translateY(1px); }
     button[disabled] { opacity: 0.55; cursor: not-allowed; transform: none; }
-    .btn-main { background: #dffde9; color: #11402d; border-color: #dffde9; }
-    .btn-soft { background: transparent; color: #eafff3; }
+    button:hover { box-shadow: 0 4px 12px rgba(10, 25, 45, 0.12); }
+    .btn-main { background: var(--brand); color: #fff; border-color: var(--brand); }
+    .btn-soft { background: #f3f6fa; color: #1e2d3d; border-color: #d8e2ed; }
+    .hero .btn-soft { background: rgba(255,255,255,0.1); color: #e9f6ff; border-color: rgba(255,255,255,0.22); }
+    .hero .btn-main { background: #f3fff9; color: #0f5339; border-color: #f3fff9; }
     .pill {
       border-radius: 999px;
       padding: 8px 12px;
       font-size: 13px;
       font-weight: 700;
-      background: rgba(255,255,255,0.16);
+      background: rgba(255,255,255,0.14);
       display: inline-flex;
       align-items: center;
       gap: 8px;
@@ -1287,57 +1769,107 @@ function htmlPage() {
       width: 8px;
       height: 8px;
       border-radius: 50%;
-      background: #d4ffe4;
+      background: #caf4ff;
       display: inline-block;
-      box-shadow: 0 0 0 0 rgba(212,255,228,0.8);
+      box-shadow: 0 0 0 0 rgba(202,244,255,0.8);
       animation: pulse 1.8s infinite;
     }
     .grid4 {
       display: grid;
-      grid-template-columns: repeat(4, minmax(0,1fr));
-      gap: 10px;
+      grid-template-columns: repeat(5, minmax(0,1fr));
+      gap: 12px;
     }
     .kpi {
-      background: rgba(255,255,255,0.1);
+      background: rgba(255,255,255,0.12);
       border: 1px solid rgba(255,255,255,0.2);
       border-radius: 12px;
-      padding: 10px;
+      padding: 12px;
       min-height: 72px;
     }
-    .kpi-label { font-size: 12px; color: #bfe8d1; margin: 0 0 5px; }
+    .kpi-label { font-size: 12px; color: #d1ebff; margin: 0 0 6px; }
     .kpi-value { margin: 0; font-size: 24px; line-height: 1; font-weight: 700; }
     .cards {
       margin-top: 16px;
       display: grid;
-      gap: 12px;
-      grid-template-columns: 1.1fr 1.1fr;
+      gap: 14px;
+      grid-template-columns: repeat(12, minmax(0,1fr));
     }
     .card {
+      grid-column: span 6;
       background: var(--card);
       border: 1px solid var(--line);
-      border-radius: 16px;
-      padding: 14px;
-      backdrop-filter: blur(6px);
-      box-shadow: 0 8px 18px rgba(20, 32, 26, 0.06);
-      animation: rise 420ms ease-out;
+      border-radius: 18px;
+      padding: 16px;
+      backdrop-filter: blur(8px);
+      box-shadow: var(--shadow);
+      animation: rise 320ms ease-out;
+      min-height: 140px;
     }
-    .card h2 { margin: 0 0 10px; font-size: 15px; letter-spacing: 0.25px; color: #173126; }
+    .card h2 {
+      margin: 0 0 10px;
+      font-size: 15px;
+      letter-spacing: 0.18px;
+      color: #1a3148;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
     .wide { grid-column: 1 / -1; }
     .meta { font-family: "IBM Plex Mono", monospace; font-size: 12px; color: var(--muted); }
     .empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
+    .chart {
+      width: 100%;
+      height: 220px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fff;
+    }
+    .bar-grid {
+      display: grid;
+      gap: 6px;
+    }
+    .bar-row {
+      display: grid;
+      grid-template-columns: 90px 1fr 90px;
+      gap: 8px;
+      align-items: center;
+      font-size: 12px;
+    }
+    .bar-track {
+      background: #edf5ef;
+      border: 1px solid #d5e5d8;
+      border-radius: 999px;
+      height: 12px;
+      overflow: hidden;
+    }
+    .bar-fill {
+      background: linear-gradient(90deg, #0d8b58, #13a66a);
+      height: 100%;
+    }
+    .warn-banner {
+      display: none;
+      border: 1px solid #ffd7ac;
+      background: #fff4e6;
+      color: #8a4805;
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 13px;
+      font-weight: 700;
+    }
     table { width: 100%; border-collapse: collapse; }
     th {
       text-align: left;
       font-size: 11px;
       letter-spacing: 0.35px;
-      color: #4f6659;
+      color: #51637a;
       text-transform: uppercase;
       border-bottom: 1px solid var(--line);
-      padding: 8px 7px;
+      padding: 9px 7px;
     }
     td {
       font-size: 13px;
-      border-bottom: 1px dashed #d8e5dc;
+      border-bottom: 1px dashed #e0e8f1;
       padding: 8px 7px;
       white-space: nowrap;
     }
@@ -1352,17 +1884,20 @@ function htmlPage() {
     .state-filled { color: var(--good); font-weight: 700; }
     .state-open { color: var(--warn); font-weight: 700; }
     .mono { font-family: "IBM Plex Mono", monospace; }
+    @media (max-width: 1180px) {
+      .card { grid-column: span 12; }
+    }
     @media (max-width: 940px) {
+      .wrap { padding: 18px 12px 34px; }
       .grid4 { grid-template-columns: repeat(2, minmax(0,1fr)); }
-      .cards { grid-template-columns: 1fr; }
     }
     @keyframes rise {
       from { opacity: 0; transform: translateY(8px); }
       to { opacity: 1; transform: translateY(0); }
     }
     @keyframes pulse {
-      0% { box-shadow: 0 0 0 0 rgba(212,255,228,0.55); }
-      70% { box-shadow: 0 0 0 8px rgba(212,255,228,0); }
+      0% { box-shadow: 0 0 0 0 rgba(202,244,255,0.55); }
+      70% { box-shadow: 0 0 0 8px rgba(202,244,255,0); }
       100% { box-shadow: 0 0 0 0 rgba(212,255,228,0); }
     }
   </style>
@@ -1385,10 +1920,17 @@ function htmlPage() {
         <button id="backtestBtn" class="btn-soft">Run Backtest</button>
         <button id="schedulerStartBtn" class="btn-soft">Start Scheduler</button>
         <button id="schedulerStopBtn" class="btn-soft">Stop Scheduler</button>
+        <button id="safeModeEnableBtn" class="btn-soft">Enable Safe Mode</button>
+        <button id="safeModeDisableBtn" class="btn-soft">Disable Safe Mode</button>
         <button id="refreshBtn" class="btn-soft">Refresh</button>
       </div>
+      <div id="safeModeBanner" class="warn-banner"></div>
       <div id="schedulerMeta" class="hero-meta">Scheduler: loading...</div>
       <div class="grid4">
+        <div class="kpi">
+          <p class="kpi-label">Usable Funds</p>
+          <p id="kpiFunds" class="kpi-value">-</p>
+        </div>
         <div class="kpi">
           <p class="kpi-label">Open Positions</p>
           <p id="kpiPositions" class="kpi-value">0</p>
@@ -1416,6 +1958,20 @@ function htmlPage() {
         <h2>Managed Trailing Stops</h2>
         <div id="managed"></div>
       </section>
+      <section class="card">
+        <h2>Position Exit Console</h2>
+        <div style="display:grid; gap:8px;">
+          <select id="exitSymbol" style="padding:8px; border-radius:8px; border:1px solid var(--line);"></select>
+          <input id="exitPercent" type="number" min="1" max="100" value="50" placeholder="Exit %" style="padding:8px; border-radius:8px; border:1px solid var(--line);" />
+          <input id="stopPriceInput" type="number" min="0" step="0.01" placeholder="New stop price" style="padding:8px; border-radius:8px; border:1px solid var(--line);" />
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <button id="exitPercentBtn" class="btn-main">Exit %</button>
+            <button id="exitFullBtn" class="btn-soft">Exit Full</button>
+            <button id="updateStopBtn" class="btn-soft">Update Stop</button>
+          </div>
+          <div id="exitStatus" class="meta"></div>
+        </div>
+      </section>
       <section class="card wide">
         <h2>Recent Orders</h2>
         <div id="orders"></div>
@@ -1427,11 +1983,23 @@ function htmlPage() {
       <section class="card wide">
         <h2>Broker Orderbook</h2>
         <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-          <select id="brokerFilter" style="padding:8px; border-radius:8px; border:1px solid var(--line);">
+          <select id="brokerStatusFilter" style="padding:8px; border-radius:8px; border:1px solid var(--line);">
             <option value="all">All</option>
             <option value="failed">Failed only</option>
+            <option value="open">Open</option>
+            <option value="complete">Complete</option>
+            <option value="rejected">Rejected</option>
+            <option value="cancelled">Cancelled</option>
           </select>
+          <select id="brokerSeverityFilter" style="padding:8px; border-radius:8px; border:1px solid var(--line);">
+            <option value="all">Severity: all</option>
+            <option value="critical">Critical</option>
+            <option value="warning">Warning</option>
+            <option value="info">Info</option>
+          </select>
+          <input id="brokerSearch" placeholder="Search symbol/order/reason" style="padding:8px; border-radius:8px; border:1px solid var(--line); min-width: 260px;" />
           <button id="brokerRefreshBtn" class="btn-soft">Refresh Broker Orders</button>
+          <button id="brokerExportBtn" class="btn-soft">Export CSV</button>
         </div>
         <div id="brokerSummary" class="meta" style="margin-top:8px;">Loading...</div>
         <div id="brokerOrders" style="margin-top:8px;"></div>
@@ -1473,6 +2041,17 @@ function htmlPage() {
         <div id="healthErrors" style="margin-top:8px;"></div>
       </section>
       <section class="card wide">
+        <h2>Daily PnL + Exposure</h2>
+        <div id="pnlSummary" class="meta">Loading...</div>
+        <svg id="pnlChart" class="chart" viewBox="0 0 1000 220" preserveAspectRatio="none"></svg>
+        <div id="exposureBars" class="bar-grid" style="margin-top:10px;"></div>
+      </section>
+      <section class="card wide">
+        <h2>Rejection Guard</h2>
+        <div id="rejectGuardSummary" class="meta">Loading...</div>
+        <div id="rejectGuardTable" style="margin-top:8px;"></div>
+      </section>
+      <section class="card wide">
         <h2>Ops Events</h2>
         <div id="opsEvents"></div>
       </section>
@@ -1487,15 +2066,29 @@ function htmlPage() {
     const backtestBtn = document.getElementById("backtestBtn");
     const schedulerStartBtn = document.getElementById("schedulerStartBtn");
     const schedulerStopBtn = document.getElementById("schedulerStopBtn");
+    const safeModeEnableBtn = document.getElementById("safeModeEnableBtn");
+    const safeModeDisableBtn = document.getElementById("safeModeDisableBtn");
+    const safeModeBanner = document.getElementById("safeModeBanner");
     const schedulerMeta = document.getElementById("schedulerMeta");
     const refreshBtn = document.getElementById("refreshBtn");
     const heroSub = document.querySelector(".hero-sub");
+    const kpiFunds = document.getElementById("kpiFunds");
     const kpiPositions = document.getElementById("kpiPositions");
     const kpiStops = document.getElementById("kpiStops");
     const kpiOrders = document.getElementById("kpiOrders");
     const kpiFills = document.getElementById("kpiFills");
-    const brokerFilter = document.getElementById("brokerFilter");
+    const exitSymbol = document.getElementById("exitSymbol");
+    const exitPercent = document.getElementById("exitPercent");
+    const stopPriceInput = document.getElementById("stopPriceInput");
+    const exitPercentBtn = document.getElementById("exitPercentBtn");
+    const exitFullBtn = document.getElementById("exitFullBtn");
+    const updateStopBtn = document.getElementById("updateStopBtn");
+    const exitStatus = document.getElementById("exitStatus");
+    const brokerStatusFilter = document.getElementById("brokerStatusFilter");
+    const brokerSeverityFilter = document.getElementById("brokerSeverityFilter");
+    const brokerSearch = document.getElementById("brokerSearch");
     const brokerRefreshBtn = document.getElementById("brokerRefreshBtn");
+    const brokerExportBtn = document.getElementById("brokerExportBtn");
     const brokerSummary = document.getElementById("brokerSummary");
     const brokerOrders = document.getElementById("brokerOrders");
     const strategySummary = document.getElementById("strategySummary");
@@ -1516,8 +2109,13 @@ function htmlPage() {
     const journalEntries = document.getElementById("journalEntries");
     const healthSummary = document.getElementById("healthSummary");
     const healthErrors = document.getElementById("healthErrors");
+    const pnlSummary = document.getElementById("pnlSummary");
+    const pnlChart = document.getElementById("pnlChart");
+    const exposureBars = document.getElementById("exposureBars");
+    const rejectGuardSummary = document.getElementById("rejectGuardSummary");
+    const rejectGuardTable = document.getElementById("rejectGuardTable");
     const opsEvents = document.getElementById("opsEvents");
-    let brokerPayload = { enabled: false, stale: false, fetchedAt: '', message: '', stats: { total: 0, complete: 0, open: 0, rejected: 0, cancelled: 0 }, orders: [] };
+    let brokerPayload = { enabled: false, stale: false, fetchedAt: '', message: '', stats: { total: 0, complete: 0, open: 0, rejected: 0, cancelled: 0, filtered: 0 }, orders: [] };
 
     morningBtn.onclick = () => trigger("/api/run/morning");
     monitorBtn.onclick = () => trigger("/api/run/monitor");
@@ -1526,10 +2124,21 @@ function htmlPage() {
     backtestBtn.onclick = () => trigger("/api/run/backtest");
     schedulerStartBtn.onclick = () => trigger("/api/scheduler/start");
     schedulerStopBtn.onclick = () => trigger("/api/scheduler/stop");
+    safeModeEnableBtn.onclick = () => setSafeMode(true);
+    safeModeDisableBtn.onclick = () => setSafeMode(false);
     refreshBtn.onclick = () => load();
     journalSaveBtn.onclick = () => saveJournalEntry();
+    exitPercentBtn.onclick = () => manualExit(false);
+    exitFullBtn.onclick = () => manualExit(true);
+    updateStopBtn.onclick = () => updateStop();
     brokerRefreshBtn.onclick = () => refreshBrokerOrders();
-    brokerFilter.onchange = () => renderBrokerOrders(brokerPayload);
+    brokerStatusFilter.onchange = () => refreshBrokerOrders();
+    brokerSeverityFilter.onchange = () => refreshBrokerOrders();
+    brokerSearch.onchange = () => refreshBrokerOrders();
+    brokerSearch.onkeyup = (e) => { if (e.key === "Enter") refreshBrokerOrders(); };
+    brokerExportBtn.onclick = () => {
+      window.open("/api/broker/orders.csv?" + currentBrokerFilterQuery(), "_blank");
+    };
 
     async function trigger(path) {
       const res = await fetch(path, { method: "POST" });
@@ -1544,19 +2153,34 @@ function htmlPage() {
     }
 
     async function load() {
-      const [status, report, broker, strategy, backtest, drift, journal, health] = await Promise.all([
-        fetchJsonSafe("/api/status", { runningJob: null, liveMode: false, lastPreflight: null, scheduler: { enabled: false, lastRuns: {} } }),
-        fetchJsonSafe("/api/report", { positions: [], managedPositions: [], orders: [], fills: [], lastBrokerSyncAt: null, latestAlerts: [], latestReconcile: [] }),
-        fetchJsonSafe("/api/broker/orders", { enabled: false, stale: false, fetchedAt: new Date().toISOString(), message: "", stats: { total: 0, complete: 0, open: 0, rejected: 0, cancelled: 0 }, orders: [] }),
+      const [status, report, broker, strategy, backtest, drift, journal, health, safeModeRes] = await Promise.all([
+        fetchJsonSafe("/api/status", { runningJob: null, liveMode: false, lastPreflight: null, safeMode: { enabled: false, reason: "", updatedAt: "", source: "default" }, scheduler: { enabled: false, lastRuns: {} } }),
+        fetchJsonSafe("/api/report", {
+          positions: [],
+          managedPositions: [],
+          orders: [],
+          fills: [],
+          dailySnapshots: [],
+          rejectGuard: { tradeDate: "", rejectCounts: {}, blockedSymbols: {} },
+          funds: null,
+          lastBrokerSyncAt: null,
+          latestAlerts: [],
+          latestReconcile: []
+        }),
+        fetchJsonSafe("/api/broker/orders?" + currentBrokerFilterQuery(), { enabled: false, stale: false, fetchedAt: new Date().toISOString(), message: "", stats: { total: 0, complete: 0, open: 0, rejected: 0, cancelled: 0, filtered: 0 }, orders: [] }),
         fetchJsonSafe("/api/strategy", { enabled: false, bySymbol: [] }),
         fetchJsonSafe("/api/backtest", { enabled: false, latest: null }),
         fetchJsonSafe("/api/drift", { enabled: false, summary: null, rows: [], message: "" }),
         fetchJsonSafe("/api/journal", { enabled: false, entries: [], closedLots: [], analytics: { bySetup: [], byWeekday: [], avgHoldDays: 0, topMistakes: [] } }),
-        fetchJsonSafe("/api/health", { checkedAt: new Date().toISOString(), db: { status: "unknown", latencyMs: null }, broker: { status: "unknown", latencyMs: null }, scheduler: { enabled: false, lastRuns: {} }, errors: [] })
+        fetchJsonSafe("/api/health", { checkedAt: new Date().toISOString(), db: { status: "unknown", latencyMs: null }, broker: { status: "unknown", latencyMs: null }, funds: null, safeMode: { enabled: false }, scheduler: { enabled: false, lastRuns: {} }, errors: [] }),
+        fetchJsonSafe("/api/safe-mode", { safeMode: { enabled: false, reason: "", updatedAt: "", source: "default" } })
       ]);
+      const safeMode = (safeModeRes && safeModeRes.safeMode) ? safeModeRes.safeMode : (status.safeMode || { enabled: false, reason: "", updatedAt: "", source: "fallback" });
 
       if (status.runningJob) {
         statusEl.innerHTML = '<span class="dot"></span>Running ' + status.runningJob;
+      } else if (safeMode.enabled) {
+        statusEl.innerHTML = '<span class="dot"></span>SAFE MODE';
       } else {
         statusEl.innerHTML = '<span class="dot"></span>Idle';
       }
@@ -1567,15 +2191,19 @@ function htmlPage() {
           : 'Last broker sync: n/a';
         const preflightText = status.lastPreflight ? 'Preflight: OK' : 'Preflight: n/a';
         const schedulerText = status.scheduler && status.scheduler.enabled ? 'Scheduler: ON' : 'Scheduler: OFF';
-        heroSub.textContent = modeText + ' | ' + syncText + ' | ' + preflightText + ' | ' + schedulerText;
+        const fundsText = report.funds ? ('Funds: ' + inr(report.funds.usableEquity) + ' usable') : 'Funds: n/a';
+        const safeText = safeMode.enabled ? 'SAFE MODE: ON' : 'SAFE MODE: OFF';
+        heroSub.textContent = modeText + ' | ' + syncText + ' | ' + preflightText + ' | ' + schedulerText + ' | ' + fundsText + ' | ' + safeText;
       }
-      morningBtn.disabled = !!status.runningJob;
+      morningBtn.disabled = !!status.runningJob || !!safeMode.enabled;
       monitorBtn.disabled = !!status.runningJob;
       preflightBtn.disabled = !!status.runningJob;
       eodBtn.disabled = !!status.runningJob;
       backtestBtn.disabled = !!status.runningJob;
-      schedulerStartBtn.disabled = !!status.runningJob || (status.scheduler && status.scheduler.enabled);
+      schedulerStartBtn.disabled = !!status.runningJob || !!safeMode.enabled || (status.scheduler && status.scheduler.enabled);
       schedulerStopBtn.disabled = !!status.runningJob || !(status.scheduler && status.scheduler.enabled);
+      safeModeEnableBtn.disabled = !!status.runningJob || !!safeMode.enabled;
+      safeModeDisableBtn.disabled = !!status.runningJob || !safeMode.enabled;
 
       if (status.scheduler && schedulerMeta) {
         const s = status.scheduler;
@@ -1586,9 +2214,26 @@ function htmlPage() {
           ' | monitor=' + s.monitorIntervalSeconds + 's' +
           ' | eod=' + s.eodAt +
           ' | backtest=' + s.backtestWeekday + ' ' + s.backtestAt +
+          ' | safe=' + (safeMode.enabled ? 'ON' : 'OFF') +
           ' | last morning=' + (last.morning ? new Date(last.morning).toLocaleString('en-IN') : 'n/a');
       }
+      if (safeModeBanner) {
+        if (safeMode.enabled) {
+          safeModeBanner.style.display = 'block';
+          const reason = safeMode.reason ? safeMode.reason : 'No reason provided';
+          safeModeBanner.textContent =
+            'Safe Mode is ON. New morning entries and scheduler start are blocked. Reason: ' +
+            reason +
+            ' | Updated: ' + new Date(safeMode.updatedAt || Date.now()).toLocaleString('en-IN');
+        } else {
+          safeModeBanner.style.display = 'none';
+          safeModeBanner.textContent = '';
+        }
+      }
 
+      if (kpiFunds) {
+        kpiFunds.textContent = report.funds ? inr(report.funds.usableEquity) : 'n/a';
+      }
       kpiPositions.textContent = String((report.positions || []).length);
       kpiStops.textContent = String((report.managedPositions || []).length);
       kpiOrders.textContent = String((report.orders || []).length);
@@ -1605,7 +2250,10 @@ function htmlPage() {
       renderDrift(drift);
       renderJournal(journal);
       renderHealth(health);
+      renderPnlExposure(report);
+      renderRejectGuard(report);
       renderOps(report);
+      hydrateExitControls(report);
     }
 
     async function fetchJsonSafe(path, fallback) {
@@ -1652,9 +2300,94 @@ function htmlPage() {
     }
 
     async function refreshBrokerOrders() {
-      const fresh = await fetchJsonSafe("/api/broker/orders?refresh=1", brokerPayload);
+      const fresh = await fetchJsonSafe("/api/broker/orders?refresh=1&" + currentBrokerFilterQuery(), brokerPayload);
       brokerPayload = fresh;
       renderBrokerOrders(brokerPayload);
+    }
+
+    function hydrateExitControls(report) {
+      const positions = report.positions || [];
+      const current = String(exitSymbol.value || "");
+      exitSymbol.innerHTML = '<option value="">Select symbol</option>' + positions.map(p =>
+        '<option value="' + p.symbol + '">' + p.symbol + ' (qty ' + p.qty + ')</option>'
+      ).join('');
+      if (current && positions.some(p => p.symbol === current)) {
+        exitSymbol.value = current;
+      }
+    }
+
+    async function manualExit(full) {
+      const symbol = String(exitSymbol.value || "").trim().toUpperCase();
+      if (!symbol) {
+        exitStatus.textContent = "Select a symbol first.";
+        return;
+      }
+      const percent = full ? 100 : Number(exitPercent.value || 0);
+      const payload = { symbol, percent, reason: full ? "Manual full exit from UI" : "Manual partial exit from UI" };
+      const res = await fetch("/api/position/exit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const body = await res.json();
+      if (!res.ok) {
+        exitStatus.textContent = body.error || "Exit failed";
+        return;
+      }
+      exitStatus.textContent =
+        "Exited " + body.result.exitedQty + " of " + body.result.symbol +
+        " at " + Number(body.result.exitPrice || 0).toFixed(2) +
+        " | Remaining: " + body.result.remainingQty;
+      await load();
+    }
+
+    async function updateStop() {
+      const symbol = String(exitSymbol.value || "").trim().toUpperCase();
+      const stopPrice = Number(stopPriceInput.value || 0);
+      if (!symbol || !stopPrice || stopPrice <= 0) {
+        exitStatus.textContent = "Select symbol and valid stop price.";
+        return;
+      }
+      const res = await fetch("/api/position/stop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbol, stopPrice })
+      });
+      const body = await res.json();
+      if (!res.ok) {
+        exitStatus.textContent = body.error || "Stop update failed";
+        return;
+      }
+      exitStatus.textContent =
+        "Stop updated for " + body.result.symbol + " to " + Number(body.result.stopPrice).toFixed(2);
+      await load();
+    }
+
+    async function setSafeMode(enabled) {
+      const reason = window.prompt(enabled ? "Enter Safe Mode reason" : "Enter reason to disable Safe Mode", enabled ? "manual risk pause" : "resume trading") || "";
+      const res = await fetch(enabled ? "/api/safe-mode/enable" : "/api/safe-mode/disable", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason })
+      });
+      const body = await res.json();
+      if (!res.ok) {
+        statusEl.textContent = body.error || "Safe mode action failed";
+        return;
+      }
+      statusEl.textContent = enabled ? "Safe Mode enabled" : "Safe Mode disabled";
+      await load();
+    }
+
+    function currentBrokerFilterQuery() {
+      const q = new URLSearchParams();
+      q.set("status", String(brokerStatusFilter.value || "all"));
+      q.set("severity", String(brokerSeverityFilter.value || "all"));
+      const search = String(brokerSearch.value || "").trim();
+      if (search) {
+        q.set("search", search);
+      }
+      return q.toString();
     }
 
     function render(id, rows, columns) {
@@ -1729,7 +2462,8 @@ function htmlPage() {
       const s = payload.stats || {};
       const staleText = payload.stale ? ' | STALE CACHE' : '';
       brokerSummary.textContent =
-        'Total: ' + (s.total || 0) +
+        'Shown: ' + (s.filtered || 0) +
+        ' | Total: ' + (s.total || 0) +
         ' | Open: ' + (s.open || 0) +
         ' | Complete: ' + (s.complete || 0) +
         ' | Rejected: ' + (s.rejected || 0) +
@@ -1738,10 +2472,7 @@ function htmlPage() {
         staleText +
         (payload.fetchedAt ? (' | Fetched: ' + new Date(payload.fetchedAt).toLocaleString('en-IN')) : '');
 
-      const filter = String(brokerFilter.value || 'all');
-      const rows = (payload.orders || []).filter(r =>
-        filter === 'failed' ? (r.status === 'REJECTED' || r.status === 'CANCELLED') : true
-      );
+      const rows = payload.orders || [];
       if (rows.length === 0) {
         brokerOrders.innerHTML = '<div class="empty">No broker orders for selected filter</div>';
         return;
@@ -1901,10 +2632,15 @@ function htmlPage() {
       const tokenText = health.token && health.token.known
         ? ('Token Left (est): ' + health.token.timeLeftHuman + ' | Expires: ' + new Date(health.token.expiresAt).toLocaleString('en-IN'))
         : ('Token Left (est): ' + ((health.token && health.token.message) ? health.token.message : 'unknown'));
+      const fundsText = health.funds
+        ? ('Usable Funds: ' + inr(health.funds.usableEquity) + ' (' + String(Math.round(Number(health.funds.fundUsagePct || 0) * 100)) + '% of available)')
+        : 'Usable Funds: n/a';
       healthSummary.textContent =
         'DB: ' + dbStatus + ' (' + dbLatency + ')' +
         ' | Broker: ' + brokerStatus + ' (' + brokerLatency + ')' +
+        ' | Safe Mode: ' + ((health.safeMode && health.safeMode.enabled) ? 'ON' : 'OFF') +
         ' | Scheduler: ' + ((health.scheduler && health.scheduler.enabled) ? 'ON' : 'OFF') +
+        ' | ' + fundsText +
         ' | ' + tokenText +
         ' | Checked: ' + new Date(health.checkedAt).toLocaleString('en-IN');
 
@@ -1918,6 +2654,89 @@ function htmlPage() {
         '<tr><td>' + new Date(r.time).toLocaleString('en-IN') + '</td><td class="mono">' + r.source + '</td><td>' + r.message + '</td></tr>'
       ).join('');
       healthErrors.innerHTML = '<table>' + head + body + '</table>';
+    }
+
+    function renderPnlExposure(report) {
+      const snaps = (report.dailySnapshots || []).slice().reverse();
+      if (snaps.length === 0) {
+        pnlSummary.textContent = "No daily snapshots yet.";
+        pnlChart.innerHTML = "";
+      } else {
+        const latest = snaps[snaps.length - 1];
+        pnlSummary.textContent =
+          "Snapshots: " + snaps.length +
+          " | Latest equity: " + inr(latest.equity) +
+          " | Realized: " + inr(latest.realized_pnl) +
+          " | Unrealized: " + inr(latest.unrealized_pnl) +
+          " | Open positions: " + latest.open_positions;
+        const pointsEq = toChartPoints(snaps.map(s => Number(s.equity || 0)));
+        const pointsR = toChartPoints(snaps.map(s => Number(s.realized_pnl || 0)));
+        const pointsU = toChartPoints(snaps.map(s => Number(s.unrealized_pnl || 0)));
+        pnlChart.innerHTML =
+          '<rect x="0" y="0" width="1000" height="220" fill="#ffffff"/>' +
+          '<path d="' + pointsEq + '" fill="none" stroke="#0a7a4e" stroke-width="2.2"/>' +
+          '<path d="' + pointsR + '" fill="none" stroke="#9f4f00" stroke-width="1.8"/>' +
+          '<path d="' + pointsU + '" fill="none" stroke="#335b9f" stroke-width="1.8"/>' +
+          '<text x="10" y="16" fill="#0a7a4e" font-size="11">Equity</text>' +
+          '<text x="80" y="16" fill="#9f4f00" font-size="11">Realized</text>' +
+          '<text x="165" y="16" fill="#335b9f" font-size="11">Unrealized</text>';
+      }
+
+      const positions = report.positions || [];
+      if (positions.length === 0) {
+        exposureBars.innerHTML = '<div class="empty">No open positions</div>';
+        return;
+      }
+      const rows = positions.map(p => ({
+        symbol: p.symbol,
+        exposure: Number(p.qty || 0) * Number(p.avg_price || 0)
+      })).sort((a, b) => b.exposure - a.exposure).slice(0, 10);
+      const maxExp = Math.max(...rows.map(r => r.exposure), 1);
+      exposureBars.innerHTML = rows.map(r =>
+        '<div class="bar-row">' +
+          '<div class="mono">' + r.symbol + '</div>' +
+          '<div class="bar-track"><div class="bar-fill" style="width:' + ((r.exposure / maxExp) * 100).toFixed(1) + '%"></div></div>' +
+          '<div style="text-align:right;">' + inr(r.exposure) + '</div>' +
+        '</div>'
+      ).join('');
+    }
+
+    function renderRejectGuard(report) {
+      const guard = report.rejectGuard || { tradeDate: "", rejectCounts: {}, blockedSymbols: {} };
+      const blocked = guard.blockedSymbols || {};
+      const symbols = Object.keys(blocked).sort();
+      rejectGuardSummary.textContent =
+        "Trade date: " + (guard.tradeDate || "n/a") +
+        " | Blocked symbols: " + symbols.length;
+      if (symbols.length === 0) {
+        rejectGuardTable.innerHTML = '<div class="empty">No blocked symbols for today</div>';
+        return;
+      }
+      const head = '<tr><th>symbol</th><th>count</th><th>blockedAt</th><th>reason</th></tr>';
+      const body = symbols.map(sym => {
+        const row = blocked[sym] || {};
+        return '<tr>' +
+          '<td class="mono">' + sym + '</td>' +
+          '<td>' + Number(row.count || 0) + '</td>' +
+          '<td>' + (row.blockedAt ? new Date(row.blockedAt).toLocaleString("en-IN") : "") + '</td>' +
+          '<td class="wrap-cell">' + String(row.reason || "") + '</td>' +
+          '</tr>';
+      }).join('');
+      rejectGuardTable.innerHTML = '<table>' + head + body + '</table>';
+    }
+
+    function toChartPoints(series) {
+      if (!series || series.length === 0) {
+        return "";
+      }
+      const min = Math.min(...series);
+      const max = Math.max(...series);
+      const span = Math.max(1e-9, max - min);
+      return series.map((v, i) => {
+        const x = series.length === 1 ? 20 : 20 + (960 * i) / (series.length - 1);
+        const y = 200 - ((v - min) / span) * 170;
+        return (i === 0 ? "M" : "L") + x.toFixed(1) + " " + y.toFixed(1);
+      }).join(" ");
     }
 
     function pct(v) {
