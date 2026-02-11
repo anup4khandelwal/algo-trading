@@ -84,7 +84,17 @@ export class ZerodhaAdapter {
       orderId: string;
       symbol: string;
       status: string;
+      side?: string;
+      qty?: number;
+      filledQty?: number;
+      cancelledQty?: number;
+      product?: string;
+      exchange?: string;
+      validity?: string;
       averagePrice: number;
+      statusMessage?: string;
+      statusMessageRaw?: string;
+      rejectedReason?: string;
       updatedAt?: string;
     }>
   > {
@@ -108,16 +118,38 @@ export class ZerodhaAdapter {
         order_id: string;
         tradingsymbol: string;
         status: string;
+        transaction_type?: string;
+        quantity?: number;
+        filled_quantity?: number;
+        cancelled_quantity?: number;
+        product?: string;
+        exchange?: string;
+        validity?: string;
         average_price: number;
+        status_message?: string;
+        status_message_raw?: string;
+        rejected_reason?: string;
         exchange_update_timestamp?: string;
+        exchange_timestamp?: string;
+        order_timestamp?: string;
       }>;
     };
     return (json.data ?? []).map((o) => ({
       orderId: o.order_id,
       symbol: o.tradingsymbol,
       status: o.status,
+      side: o.transaction_type,
+      qty: o.quantity,
+      filledQty: o.filled_quantity,
+      cancelledQty: o.cancelled_quantity,
+      product: o.product,
+      exchange: o.exchange,
+      validity: o.validity,
       averagePrice: o.average_price ?? 0,
-      updatedAt: o.exchange_update_timestamp
+      statusMessage: o.status_message,
+      statusMessageRaw: o.status_message_raw,
+      rejectedReason: o.rejected_reason,
+      updatedAt: o.exchange_update_timestamp ?? o.exchange_timestamp ?? o.order_timestamp
     }));
   }
 

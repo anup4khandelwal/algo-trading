@@ -162,6 +162,13 @@ Thresholds:
 - `DRIFT_WINRATE_ALERT_PCT` (default `12`)
 - `DRIFT_AVGR_ALERT` (default `0.5`)
 
+## Broker Orderbook UI
+Dashboard includes **Broker Orderbook** (today scope):
+- live broker orders with `status`, `reason`, and action hints
+- filter: `All` / `Failed only`
+- manual refresh button
+- server-side cache for API protection (`BROKER_ORDERS_CACHE_MS`, default `30000`)
+
 ## Recommended Daily Runbook
 1. Refresh token (`npm run auth`) before market open.
 2. Run `npm run morning`.

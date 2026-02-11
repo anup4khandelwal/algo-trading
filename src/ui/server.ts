@@ -17,9 +17,29 @@ dotenv.config();
 
 const PORT = Number(process.env.UI_PORT ?? "3000");
 type UiJob = "morning" | "monitor" | "preflight" | "backtest" | "eod_close";
+type BrokerOrdersReport = {
+  enabled: boolean;
+  stale: boolean;
+  fetchedAt: string;
+  message: string;
+  stats: {
+    total: number;
+    complete: number;
+    open: number;
+    rejected: number;
+    cancelled: number;
+  };
+  orders: Array<Record<string, unknown>>;
+};
 let runningJob: UiJob | null = null;
 let lastDbErrorLogAt = 0;
 const runtimeErrors: Array<{ time: string; source: string; message: string }> = [];
+let brokerOrdersCache:
+  | {
+      fetchedAtMs: number;
+      data: BrokerOrdersReport;
+    }
+  | null = null;
 const scheduler = new TradingScheduler(
   {
     runMorning: () => runUiJob("morning", "SCHED_MORNING", () => runMorningWorkflow()),
@@ -80,6 +100,13 @@ const server = http.createServer(async (req, res) => {
     if (method === "GET" && url.pathname === "/api/health") {
       const health = await getHealthReport();
       json(res, 200, health);
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/api/broker/orders") {
+      const refresh = url.searchParams.get("refresh") === "1";
+      const brokerOrders = await getBrokerOrdersReport(refresh);
+      json(res, 200, brokerOrders);
       return;
     }
 
@@ -718,6 +745,114 @@ async function getHealthReport() {
   };
 }
 
+async function getBrokerOrdersReport(forceRefresh = false): Promise<BrokerOrdersReport> {
+  const ttlMs = Number(process.env.BROKER_ORDERS_CACHE_MS ?? "30000");
+  if (!forceRefresh && brokerOrdersCache && Date.now() - brokerOrdersCache.fetchedAtMs < ttlMs) {
+    return brokerOrdersCache.data;
+  }
+
+  if (process.env.LIVE_ORDER_MODE !== "1") {
+    const data = {
+      enabled: false,
+      stale: false,
+      fetchedAt: new Date().toISOString(),
+      message: "Broker orders are available only in live mode.",
+      stats: { total: 0, complete: 0, open: 0, rejected: 0, cancelled: 0 },
+      orders: [] as Array<Record<string, unknown>>
+    };
+    brokerOrdersCache = { fetchedAtMs: Date.now(), data };
+    return data;
+  }
+
+  const apiKey = process.env.KITE_API_KEY;
+  const accessToken = process.env.KITE_ACCESS_TOKEN;
+  if (!apiKey || !accessToken) {
+    const data = {
+      enabled: false,
+      stale: false,
+      fetchedAt: new Date().toISOString(),
+      message: "KITE_API_KEY or KITE_ACCESS_TOKEN is missing.",
+      stats: { total: 0, complete: 0, open: 0, rejected: 0, cancelled: 0 },
+      orders: [] as Array<Record<string, unknown>>
+    };
+    brokerOrdersCache = { fetchedAtMs: Date.now(), data };
+    return data;
+  }
+
+  try {
+    const exec = new ZerodhaAdapter(new MapLtpProvider(new Map([["NIFTYBEES", 1]])), {
+      mode: "live",
+      apiKey,
+      accessToken,
+      exchange: process.env.KITE_EXCHANGE ?? "NSE",
+      product: process.env.KITE_PRODUCT ?? "CNC",
+      orderVariety: (process.env.KITE_ORDER_VARIETY as "regular" | "amo" | undefined) ?? "regular"
+    });
+    const rows = await exec.fetchBrokerOrders();
+    const today = getIstTradeDate();
+    const orders = rows
+      .filter((o) => !o.updatedAt || toIstDate(o.updatedAt) === today)
+      .map((o) => {
+        const reason =
+          o.rejectedReason ?? o.statusMessageRaw ?? o.statusMessage ?? "";
+        const diag = diagnoseBrokerOrder(reason, o.status);
+        return {
+          orderId: o.orderId,
+          symbol: o.symbol,
+          status: o.status,
+          side: o.side ?? "",
+          qty: o.qty ?? 0,
+          filledQty: o.filledQty ?? 0,
+          cancelledQty: o.cancelledQty ?? 0,
+          product: o.product ?? "",
+          exchange: o.exchange ?? "",
+          validity: o.validity ?? "",
+          averagePrice: o.averagePrice,
+          updatedAt: o.updatedAt ?? "",
+          reason,
+          hintCode: diag.hintCode,
+          hintText: diag.hintText,
+          severity: diag.severity
+        };
+      })
+      .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+    const stats = {
+      total: orders.length,
+      complete: orders.filter((o) => o.status === "COMPLETE").length,
+      open: orders.filter((o) => ["OPEN", "TRIGGER PENDING", "MODIFY VALIDATION PENDING"].includes(o.status)).length,
+      rejected: orders.filter((o) => o.status === "REJECTED").length,
+      cancelled: orders.filter((o) => o.status === "CANCELLED").length
+    };
+    const data = {
+      enabled: true,
+      stale: false,
+      fetchedAt: new Date().toISOString(),
+      message: "",
+      stats,
+      orders
+    };
+    brokerOrdersCache = { fetchedAtMs: Date.now(), data };
+    return data;
+  } catch (err) {
+    pushRuntimeError("BROKER_ORDERS", err);
+    if (brokerOrdersCache) {
+      return {
+        ...brokerOrdersCache.data,
+        stale: true,
+        message: `Broker API unavailable. Showing cached data. ${err instanceof Error ? err.message : String(err)}`
+      };
+    }
+    return {
+      enabled: false,
+      stale: false,
+      fetchedAt: new Date().toISOString(),
+      message: err instanceof Error ? err.message : String(err),
+      stats: { total: 0, complete: 0, open: 0, rejected: 0, cancelled: 0 },
+      orders: [] as Array<Record<string, unknown>>
+    };
+  }
+}
+
 async function checkDbHealth(databaseUrl: string | undefined) {
   if (!databaseUrl) {
     return { status: "off", latencyMs: null, message: "DATABASE_URL is not set" };
@@ -826,6 +961,85 @@ function humanDuration(ms: number) {
   const h = Math.floor(sec / 3600);
   const m = Math.floor((sec % 3600) / 60);
   return `${h}h ${m}m`;
+}
+
+function diagnoseBrokerOrder(reasonRaw: string, status: string) {
+  const reason = reasonRaw.toLowerCase();
+  if (status === "COMPLETE") {
+    return { hintCode: "ok", hintText: "", severity: "info" };
+  }
+  if (reason.includes("switch_to_amo") || reason.includes("after market order")) {
+    return {
+      hintCode: "switch_to_amo",
+      hintText: "Broker wants AMO. Use KITE_ENABLE_AMO_FALLBACK=1 or place during market hours.",
+      severity: "warning"
+    };
+  }
+  if (
+    reason.includes("insufficient") ||
+    reason.includes("margin") ||
+    reason.includes("funds")
+  ) {
+    return {
+      hintCode: "insufficient_margin",
+      hintText: "Insufficient margin/funds. Reduce quantity or add funds.",
+      severity: "critical"
+    };
+  }
+  if (reason.includes("freeze") && reason.includes("quantity")) {
+    return {
+      hintCode: "freeze_quantity",
+      hintText: "Quantity exceeds exchange freeze limit. Split order into smaller chunks.",
+      severity: "warning"
+    };
+  }
+  if (reason.includes("product")) {
+    return {
+      hintCode: "product_mismatch",
+      hintText: "Product mismatch. Check KITE_PRODUCT and instrument segment.",
+      severity: "warning"
+    };
+  }
+  if (
+    reason.includes("tokenexception") ||
+    reason.includes("incorrect `api_key`") ||
+    reason.includes("access_token")
+  ) {
+    return {
+      hintCode: "auth_error",
+      hintText: "Auth/token issue. Regenerate access token via npm run auth.",
+      severity: "critical"
+    };
+  }
+  if (status === "REJECTED" || status === "CANCELLED") {
+    return {
+      hintCode: "generic_reject",
+      hintText: "See broker reason and RMS rules; retry only after root cause is fixed.",
+      severity: "warning"
+    };
+  }
+  return { hintCode: "n/a", hintText: "", severity: "info" };
+}
+
+function getIstTradeDate(now = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(now);
+  const y = parts.find((p) => p.type === "year")?.value ?? "1970";
+  const m = parts.find((p) => p.type === "month")?.value ?? "01";
+  const d = parts.find((p) => p.type === "day")?.value ?? "01";
+  return `${y}-${m}-${d}`;
+}
+
+function toIstDate(input: string) {
+  const date = new Date(input);
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+  return getIstTradeDate(date);
 }
 
 function summarizeBySymbol(rows: { symbol: string; pnl: number; rMultiple: number }[]) {
@@ -1127,6 +1341,12 @@ function htmlPage() {
       padding: 8px 7px;
       white-space: nowrap;
     }
+    .wrap-cell {
+      white-space: normal;
+      word-break: break-word;
+      line-height: 1.3;
+      max-width: 420px;
+    }
     .buy { color: var(--good); font-weight: 700; }
     .sell { color: var(--danger); font-weight: 700; }
     .state-filled { color: var(--good); font-weight: 700; }
@@ -1205,6 +1425,18 @@ function htmlPage() {
         <div id="fills"></div>
       </section>
       <section class="card wide">
+        <h2>Broker Orderbook</h2>
+        <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+          <select id="brokerFilter" style="padding:8px; border-radius:8px; border:1px solid var(--line);">
+            <option value="all">All</option>
+            <option value="failed">Failed only</option>
+          </select>
+          <button id="brokerRefreshBtn" class="btn-soft">Refresh Broker Orders</button>
+        </div>
+        <div id="brokerSummary" class="meta" style="margin-top:8px;">Loading...</div>
+        <div id="brokerOrders" style="margin-top:8px;"></div>
+      </section>
+      <section class="card wide">
         <h2>Strategy Analytics</h2>
         <div id="strategySummary" class="meta">Loading...</div>
         <div id="strategyBySymbol" style="margin-top:8px;"></div>
@@ -1262,6 +1494,10 @@ function htmlPage() {
     const kpiStops = document.getElementById("kpiStops");
     const kpiOrders = document.getElementById("kpiOrders");
     const kpiFills = document.getElementById("kpiFills");
+    const brokerFilter = document.getElementById("brokerFilter");
+    const brokerRefreshBtn = document.getElementById("brokerRefreshBtn");
+    const brokerSummary = document.getElementById("brokerSummary");
+    const brokerOrders = document.getElementById("brokerOrders");
     const strategySummary = document.getElementById("strategySummary");
     const strategyBySymbol = document.getElementById("strategyBySymbol");
     const backtestSummary = document.getElementById("backtestSummary");
@@ -1281,6 +1517,7 @@ function htmlPage() {
     const healthSummary = document.getElementById("healthSummary");
     const healthErrors = document.getElementById("healthErrors");
     const opsEvents = document.getElementById("opsEvents");
+    let brokerPayload = { enabled: false, stale: false, fetchedAt: '', message: '', stats: { total: 0, complete: 0, open: 0, rejected: 0, cancelled: 0 }, orders: [] };
 
     morningBtn.onclick = () => trigger("/api/run/morning");
     monitorBtn.onclick = () => trigger("/api/run/monitor");
@@ -1291,6 +1528,8 @@ function htmlPage() {
     schedulerStopBtn.onclick = () => trigger("/api/scheduler/stop");
     refreshBtn.onclick = () => load();
     journalSaveBtn.onclick = () => saveJournalEntry();
+    brokerRefreshBtn.onclick = () => refreshBrokerOrders();
+    brokerFilter.onchange = () => renderBrokerOrders(brokerPayload);
 
     async function trigger(path) {
       const res = await fetch(path, { method: "POST" });
@@ -1305,9 +1544,10 @@ function htmlPage() {
     }
 
     async function load() {
-      const [status, report, strategy, backtest, drift, journal, health] = await Promise.all([
+      const [status, report, broker, strategy, backtest, drift, journal, health] = await Promise.all([
         fetchJsonSafe("/api/status", { runningJob: null, liveMode: false, lastPreflight: null, scheduler: { enabled: false, lastRuns: {} } }),
         fetchJsonSafe("/api/report", { positions: [], managedPositions: [], orders: [], fills: [], lastBrokerSyncAt: null, latestAlerts: [], latestReconcile: [] }),
+        fetchJsonSafe("/api/broker/orders", { enabled: false, stale: false, fetchedAt: new Date().toISOString(), message: "", stats: { total: 0, complete: 0, open: 0, rejected: 0, cancelled: 0 }, orders: [] }),
         fetchJsonSafe("/api/strategy", { enabled: false, bySymbol: [] }),
         fetchJsonSafe("/api/backtest", { enabled: false, latest: null }),
         fetchJsonSafe("/api/drift", { enabled: false, summary: null, rows: [], message: "" }),
@@ -1358,6 +1598,8 @@ function htmlPage() {
       render("managed", report.managedPositions, ["symbol", "qty", "atr14", "stop_price", "highest_price", "updated_at"]);
       render("orders", report.orders, ["order_id", "symbol", "side", "qty", "state", "avg_fill_price", "updated_at"]);
       render("fills", report.fills, ["order_id", "symbol", "side", "qty", "price", "fill_time"]);
+      brokerPayload = broker;
+      renderBrokerOrders(brokerPayload);
       renderStrategy(strategy);
       renderBacktest(backtest);
       renderDrift(drift);
@@ -1407,6 +1649,12 @@ function htmlPage() {
       }
       journalStatus.textContent = "Journal saved.";
       await load();
+    }
+
+    async function refreshBrokerOrders() {
+      const fresh = await fetchJsonSafe("/api/broker/orders?refresh=1", brokerPayload);
+      brokerPayload = fresh;
+      renderBrokerOrders(brokerPayload);
     }
 
     function render(id, rows, columns) {
@@ -1470,6 +1718,49 @@ function htmlPage() {
         '<tr><td class="mono">' + r.symbol + '</td><td>' + r.trades + '</td><td>' + pct(r.winRate) + '</td><td>' + Number(r.avgR).toFixed(3) + '</td><td>' + inr(r.pnl) + '</td></tr>'
       ).join('');
       strategyBySymbol.innerHTML = '<table>' + head + body + '</table>';
+    }
+
+    function renderBrokerOrders(payload) {
+      if (!payload || !payload.enabled) {
+        brokerSummary.textContent = payload && payload.message ? payload.message : 'Broker orders unavailable.';
+        brokerOrders.innerHTML = '<div class="empty">No data</div>';
+        return;
+      }
+      const s = payload.stats || {};
+      const staleText = payload.stale ? ' | STALE CACHE' : '';
+      brokerSummary.textContent =
+        'Total: ' + (s.total || 0) +
+        ' | Open: ' + (s.open || 0) +
+        ' | Complete: ' + (s.complete || 0) +
+        ' | Rejected: ' + (s.rejected || 0) +
+        ' | Cancelled: ' + (s.cancelled || 0) +
+        (payload.message ? (' | ' + payload.message) : '') +
+        staleText +
+        (payload.fetchedAt ? (' | Fetched: ' + new Date(payload.fetchedAt).toLocaleString('en-IN')) : '');
+
+      const filter = String(brokerFilter.value || 'all');
+      const rows = (payload.orders || []).filter(r =>
+        filter === 'failed' ? (r.status === 'REJECTED' || r.status === 'CANCELLED') : true
+      );
+      if (rows.length === 0) {
+        brokerOrders.innerHTML = '<div class="empty">No broker orders for selected filter</div>';
+        return;
+      }
+      const head = '<tr><th>time</th><th>orderId</th><th>symbol</th><th>side</th><th>qty</th><th>status</th><th>avg</th><th>reason</th><th>hint</th></tr>';
+      const body = rows.map(r =>
+        '<tr>' +
+        '<td>' + (r.updatedAt ? new Date(r.updatedAt).toLocaleString('en-IN') : '') + '</td>' +
+        '<td class="mono">' + (r.orderId || '') + '</td>' +
+        '<td class="mono">' + (r.symbol || '') + '</td>' +
+        '<td class="' + (String(r.side || '').toUpperCase() === 'BUY' ? 'buy mono' : (String(r.side || '').toUpperCase() === 'SELL' ? 'sell mono' : 'mono')) + '">' + (r.side || '') + '</td>' +
+        '<td>' + (r.qty ?? '') + '</td>' +
+        '<td class="mono">' + (r.status || '') + '</td>' +
+        '<td>' + (r.averagePrice !== undefined ? Number(r.averagePrice).toFixed(2) : '') + '</td>' +
+        '<td class="wrap-cell">' + (r.reason || '') + '</td>' +
+        '<td class="wrap-cell">' + (r.hintText || '') + '</td>' +
+        '</tr>'
+      ).join('');
+      brokerOrders.innerHTML = '<table>' + head + body + '</table>';
     }
 
     function renderBacktest(backtest) {

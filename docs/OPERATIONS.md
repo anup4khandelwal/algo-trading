@@ -30,6 +30,7 @@ npm run live
 - managed stops
 - broker sync time
 - scheduler state and controls
+- broker orderbook rejects and action hints
 
 ## End-of-day
 1. If strategy requires flat book:
