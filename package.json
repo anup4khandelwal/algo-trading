@@ -1,0 +1,37 @@
+{
+  "name": "algo-trading",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "demo": "npm run build && node dist/demo.js",
+    "entry": "npm run build && node -e \"import('./dist/pipeline.js').then(m => m.runEntryPass())\"",
+    "monitor": "npm run build && node -e \"import('./dist/pipeline.js').then(m => m.runMonitorPass())\"",
+    "live": "npm run build && node dist/live/live_loop.js",
+    "ui": "npm run build && node dist/ui/server.js",
+    "db:init": "npm run build && node dist/scripts/db_init.js",
+    "db:check": "npm run build && node dist/scripts/db_check.js",
+    "db:report": "npm run build && node dist/scripts/db_report.js",
+    "reconcile": "npm run build && node dist/scripts/reconcile.js",
+    "eod:close": "npm run build && node dist/scripts/eod_close.js",
+    "trades:export": "npm run build && node dist/scripts/export_trades_csv.js",
+    "strategy:report": "npm run build && node dist/scripts/strategy_report.js",
+    "strategy:rebalance": "npm run build && node dist/scripts/strategy_rebalance.js",
+    "morning": "npm run db:check && npm run reconcile && npm run demo && npm run db:report",
+    "weekly": "npm run strategy:report && npm run strategy:rebalance && npm run trades:export",
+    "auth": "npm run build && node dist/auth/server.js",
+    "start": "node dist/index.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/pg": "^8.16.0",
+    "dotenv": "^17.2.4",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.21.0",
+    "typescript": "^5.7.3"
+  },
+  "dependencies": {
+    "pg": "^8.18.0"
+  }
+}
