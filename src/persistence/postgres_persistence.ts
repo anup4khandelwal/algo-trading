@@ -16,9 +16,23 @@ import { ReconcileAudit } from "./persistence.js";
 
 export class PostgresPersistence implements Persistence {
   private pool: Pool;
+  private static pools = new Map<string, Pool>();
 
   constructor(databaseUrl: string) {
-    this.pool = new Pool({ connectionString: databaseUrl });
+    const key = databaseUrl.trim();
+    const existing = PostgresPersistence.pools.get(key);
+    if (existing) {
+      this.pool = existing;
+      return;
+    }
+    const pool = new Pool({
+      connectionString: key,
+      max: Number(process.env.PG_POOL_MAX ?? "10"),
+      idleTimeoutMillis: Number(process.env.PG_IDLE_TIMEOUT_MS ?? "30000"),
+      connectionTimeoutMillis: Number(process.env.PG_CONNECT_TIMEOUT_MS ?? "5000")
+    });
+    PostgresPersistence.pools.set(key, pool);
+    this.pool = pool;
   }
 
   async init(): Promise<void> {
