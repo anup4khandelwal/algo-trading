@@ -12,6 +12,7 @@ import { KiteHistoricalProvider } from "./market_data/kite_historical_provider.j
 import { PositionMonitor } from "./monitor/position_monitor.js";
 import { NoopPersistence } from "./persistence/persistence.js";
 import { PostgresPersistence } from "./persistence/postgres_persistence.js";
+import { buildAlerter } from "./ops/alerter.js";
 import dotenv from "dotenv";
 
 export async function runDailyPipeline() {
@@ -21,7 +22,13 @@ export async function runDailyPipeline() {
 export async function runMorningWorkflow() {
   dotenv.config();
   const runtime = await createRuntime();
-  const { store, signalBuilder, risk, oms, exec, portfolio, positionMonitor } = runtime;
+  const { store, signalBuilder, risk, oms, exec, portfolio, positionMonitor, alerter } = runtime;
+  const preflight = await exec.preflightCheck();
+  await runtime.persistence.upsertSystemState("last_preflight", JSON.stringify(preflight));
+  if (!preflight.ok) {
+    await alerter.notify("critical", "preflight_failed", preflight.message, preflight);
+    throw new Error(preflight.message);
+  }
   if (isTradingHalted()) {
     console.warn("HALT_TRADING=1, skipping entries");
     await runMonitorCycles(positionMonitor);
@@ -39,7 +46,8 @@ export async function runMorningWorkflow() {
     exec,
     portfolio,
     positionMonitor,
-    runtime.persistence
+    runtime.persistence,
+    alerter
   );
   await runMonitorCycles(positionMonitor);
   await persistDailySnapshot(runtime, "morning");
@@ -50,6 +58,12 @@ export async function runMonitorPass() {
   dotenv.config();
   const runtime = await createRuntime();
   if (runtime.exec.isLiveMode()) {
+    const preflight = await runtime.exec.preflightCheck();
+    await runtime.persistence.upsertSystemState("last_preflight", JSON.stringify(preflight));
+    if (!preflight.ok) {
+      await runtime.alerter.notify("critical", "preflight_failed", preflight.message, preflight);
+      throw new Error(preflight.message);
+    }
     await runtime.exec.reconcileBrokerPositions(runtime.store, runtime.persistence);
     await runtime.persistence.upsertSystemState("last_broker_sync_at", new Date().toISOString());
   }
@@ -62,6 +76,12 @@ export async function runMonitorPass() {
 export async function runEntryPass() {
   dotenv.config();
   const runtime = await createRuntime();
+  const preflight = await runtime.exec.preflightCheck();
+  await runtime.persistence.upsertSystemState("last_preflight", JSON.stringify(preflight));
+  if (!preflight.ok) {
+    await runtime.alerter.notify("critical", "preflight_failed", preflight.message, preflight);
+    throw new Error(preflight.message);
+  }
   if (isTradingHalted()) {
     console.warn("HALT_TRADING=1, skipping entry pass");
     await persistDailySnapshot(runtime, "halted_entry");
@@ -77,7 +97,8 @@ export async function runEntryPass() {
     runtime.exec,
     runtime.portfolio,
     runtime.positionMonitor,
-    runtime.persistence
+    runtime.persistence,
+    runtime.alerter
   );
   await persistDailySnapshot(runtime, "entry");
   console.log("Portfolio", runtime.store.getSnapshot());
@@ -86,9 +107,32 @@ export async function runEntryPass() {
 export async function runReconcilePass() {
   dotenv.config();
   const runtime = await createRuntime();
+  let driftCount = 0;
   if (runtime.exec.isLiveMode()) {
+    const preflight = await runtime.exec.preflightCheck();
+    await runtime.persistence.upsertSystemState("last_preflight", JSON.stringify(preflight));
+    if (!preflight.ok) {
+      await runtime.alerter.notify("critical", "preflight_failed", preflight.message, preflight);
+      throw new Error(preflight.message);
+    }
+    const before = runtime.store.positions.size;
     await runtime.exec.reconcileBrokerPositions(runtime.store, runtime.persistence);
+    const after = runtime.store.positions.size;
+    driftCount = Math.abs(before - after);
     await runtime.persistence.upsertSystemState("last_broker_sync_at", new Date().toISOString());
+    await runtime.persistence.insertReconcileAudit({
+      runId: `reconcile-${Date.now()}`,
+      driftCount,
+      detailsJson: JSON.stringify({ before, after })
+    });
+    if (driftCount > 0) {
+      await runtime.alerter.notify(
+        "warning",
+        "reconcile_drift",
+        `Detected broker/local position drift: ${driftCount}`,
+        { before, after }
+      );
+    }
   }
   await runtime.positionMonitor.reconcileWithPositions();
   await persistDailySnapshot(runtime, "reconcile");
@@ -109,6 +153,18 @@ export async function runEodClosePass() {
   console.log("Portfolio", runtime.store.getSnapshot());
 }
 
+export async function runPreflightPass() {
+  dotenv.config();
+  const runtime = await createRuntime();
+  const preflight = await runtime.exec.preflightCheck();
+  await runtime.persistence.upsertSystemState("last_preflight", JSON.stringify(preflight));
+  if (!preflight.ok) {
+    await runtime.alerter.notify("critical", "preflight_failed", preflight.message, preflight);
+    throw new Error(preflight.message);
+  }
+  console.log("PREFLIGHT_OK", preflight);
+}
+
 async function placeSignals(
   signals: Signal[],
   store: InMemoryStore,
@@ -117,7 +173,8 @@ async function placeSignals(
   exec: ZerodhaAdapter,
   portfolio: PortfolioService,
   positionMonitor: PositionMonitor,
-  persistence: Awaited<ReturnType<typeof buildPersistence>>
+  persistence: Awaited<ReturnType<typeof buildPersistence>>,
+  alerter: ReturnType<typeof buildAlerter>
 ) {
   validateLiveModeSafety(exec);
   const maxConsecutiveErrors = Number(process.env.MAX_CONSECUTIVE_ORDER_ERRORS ?? "3");
@@ -173,6 +230,12 @@ async function placeSignals(
     } catch (err) {
       consecutiveErrors += 1;
       console.error("ORDER_ERROR", signal.symbol, err);
+      await alerter.notify(
+        "critical",
+        "order_error",
+        `Order failed for ${signal.symbol}`,
+        { error: String(err) }
+      );
       if (consecutiveErrors >= maxConsecutiveErrors) {
         console.error(
           `CIRCUIT_BREAKER_TRIPPED after ${consecutiveErrors} consecutive order errors`
@@ -180,6 +243,11 @@ async function placeSignals(
         await persistence.upsertSystemState(
           "last_circuit_breaker_at",
           new Date().toISOString()
+        );
+        await alerter.notify(
+          "critical",
+          "circuit_breaker_tripped",
+          `Circuit breaker tripped after ${consecutiveErrors} consecutive order errors`
         );
         break;
       }
@@ -244,6 +312,7 @@ async function createRuntime() {
     persistence
   );
   await positionMonitor.hydrate();
+  const alerter = buildAlerter(persistence);
   if (exec.isLiveMode()) {
     await exec.reconcileBrokerPositions(store, persistence);
     await persistence.upsertSystemState("last_broker_sync_at", new Date().toISOString());
@@ -258,7 +327,8 @@ async function createRuntime() {
     exec,
     portfolio,
     positionMonitor,
-    persistence
+    persistence,
+    alerter
   };
 }
 

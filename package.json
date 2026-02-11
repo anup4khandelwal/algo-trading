@@ -13,6 +13,7 @@
     "db:init": "npm run build && node dist/scripts/db_init.js",
     "db:check": "npm run build && node dist/scripts/db_check.js",
     "db:report": "npm run build && node dist/scripts/db_report.js",
+    "preflight": "npm run build && node dist/scripts/preflight.js",
     "reconcile": "npm run build && node dist/scripts/reconcile.js",
     "eod:close": "npm run build && node dist/scripts/eod_close.js",
     "trades:export": "npm run build && node dist/scripts/export_trades_csv.js",

@@ -6,7 +6,11 @@
 1. Ensure Postgres is up.
 2. Refresh Kite access token (`npm run auth`).
 3. Confirm `.env` risk limits and safety flags.
-4. Run:
+4. Run live preflight:
+```bash
+npm run preflight
+```
+5. Run:
 ```bash
 npm run morning
 ```

@@ -1,11 +1,13 @@
 import { Pool } from "pg";
 import { Fill, Order, Position } from "../types.js";
 import {
+  AlertEvent,
   ClosedTradeLot,
   DailySnapshot,
   ManagedPositionRecord,
   Persistence
 } from "./persistence.js";
+import { ReconcileAudit } from "./persistence.js";
 
 export class PostgresPersistence implements Persistence {
   private pool: Pool;
@@ -83,6 +85,23 @@ export class PostgresPersistence implements Persistence {
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL,
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS alert_events (
+        id BIGSERIAL PRIMARY KEY,
+        severity TEXT NOT NULL,
+        type TEXT NOT NULL,
+        message TEXT NOT NULL,
+        context_json TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS reconcile_audit (
+        id BIGSERIAL PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        drift_count INTEGER NOT NULL,
+        details_json TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
     `);
   }
@@ -368,6 +387,67 @@ export class PostgresPersistence implements Persistence {
       return null;
     }
     return rows[0].value;
+  }
+
+  async insertAlertEvent(event: Omit<AlertEvent, "id" | "createdAt">): Promise<void> {
+    await this.pool.query(
+      `
+      INSERT INTO alert_events (severity, type, message, context_json)
+      VALUES ($1,$2,$3,$4)
+      `,
+      [event.severity, event.type, event.message, event.contextJson ?? null]
+    );
+  }
+
+  async loadLatestAlertEvents(limit: number): Promise<AlertEvent[]> {
+    const { rows } = await this.pool.query(
+      `
+      SELECT id, severity, type, message, context_json, created_at
+      FROM alert_events
+      ORDER BY created_at DESC
+      LIMIT $1
+      `,
+      [limit]
+    );
+    return rows.map((row) => ({
+      id: Number(row.id),
+      severity: row.severity,
+      type: row.type,
+      message: row.message,
+      contextJson: row.context_json ?? undefined,
+      createdAt: new Date(row.created_at).toISOString()
+    }));
+  }
+
+  async insertReconcileAudit(
+    audit: Omit<ReconcileAudit, "id" | "createdAt">
+  ): Promise<void> {
+    await this.pool.query(
+      `
+      INSERT INTO reconcile_audit (run_id, drift_count, details_json)
+      VALUES ($1,$2,$3)
+      `,
+      [audit.runId, audit.driftCount, audit.detailsJson ?? null]
+    );
+  }
+
+  async loadLatestReconcileAudits(limit: number): Promise<ReconcileAudit[]> {
+    const { rows } = await this.pool.query(
+      `
+      SELECT id, run_id, drift_count, details_json, created_at
+      FROM reconcile_audit
+      ORDER BY created_at DESC
+      LIMIT $1
+      `,
+      [limit]
+    );
+    return rows.map((row) => ({
+      id: Number(row.id),
+      runId: row.run_id,
+      driftCount: Number(row.drift_count),
+      detailsJson: row.details_json ?? undefined,
+      createdAt: new Date(row.created_at).toISOString()
+    }));
   }
 }
 

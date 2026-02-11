@@ -42,6 +42,84 @@ export class ZerodhaAdapter {
     };
   }
 
+  async preflightCheck(): Promise<{
+    ok: boolean;
+    mode: "paper" | "live";
+    message: string;
+    accountUserId?: string;
+  }> {
+    if (!this.isLiveMode()) {
+      return { ok: true, mode: "paper", message: "Paper mode preflight passed" };
+    }
+    const { apiKey, accessToken } = this.credentials();
+    const baseUrl = this.cfg.baseUrl ?? "https://api.kite.trade";
+    const res = await fetch(`${baseUrl}/user/profile`, {
+      headers: {
+        "X-Kite-Version": "3",
+        Authorization: `token ${apiKey}:${accessToken}`
+      }
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      return {
+        ok: false,
+        mode: "live",
+        message: `Live preflight failed ${res.status}: ${body}`
+      };
+    }
+    const json = (await res.json()) as {
+      data?: { user_id?: string };
+    };
+    return {
+      ok: true,
+      mode: "live",
+      message: "Live preflight passed",
+      accountUserId: json.data?.user_id
+    };
+  }
+
+  async fetchBrokerOrders(): Promise<
+    Array<{
+      orderId: string;
+      symbol: string;
+      status: string;
+      averagePrice: number;
+      updatedAt?: string;
+    }>
+  > {
+    if (!this.isLiveMode()) {
+      return [];
+    }
+    const { apiKey, accessToken } = this.credentials();
+    const baseUrl = this.cfg.baseUrl ?? "https://api.kite.trade";
+    const res = await fetch(`${baseUrl}/orders`, {
+      headers: {
+        "X-Kite-Version": "3",
+        Authorization: `token ${apiKey}:${accessToken}`
+      }
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`fetchBrokerOrders failed ${res.status}: ${body}`);
+    }
+    const json = (await res.json()) as {
+      data?: Array<{
+        order_id: string;
+        tradingsymbol: string;
+        status: string;
+        average_price: number;
+        exchange_update_timestamp?: string;
+      }>;
+    };
+    return (json.data ?? []).map((o) => ({
+      orderId: o.order_id,
+      symbol: o.tradingsymbol,
+      status: o.status,
+      averagePrice: o.average_price ?? 0,
+      updatedAt: o.exchange_update_timestamp
+    }));
+  }
+
   async reconcileBrokerPositions(
     store: InMemoryStore,
     persistence: Persistence

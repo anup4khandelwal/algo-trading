@@ -1,13 +1,13 @@
 import http from "node:http";
 import dotenv from "dotenv";
 import { Pool } from "pg";
-import { runMonitorPass, runMorningWorkflow } from "../pipeline.js";
+import { runMonitorPass, runMorningWorkflow, runPreflightPass } from "../pipeline.js";
 import { PostgresPersistence } from "../persistence/postgres_persistence.js";
 
 dotenv.config();
 
 const PORT = Number(process.env.UI_PORT ?? "3000");
-let runningJob: "morning" | "monitor" | null = null;
+let runningJob: "morning" | "monitor" | "preflight" | null = null;
 let lastDbErrorLogAt = 0;
 
 const server = http.createServer(async (req, res) => {
@@ -22,9 +22,11 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (method === "GET" && url.pathname === "/api/status") {
+      const report = await getDbReport();
       json(res, 200, {
         runningJob,
-        liveMode: process.env.LIVE_ORDER_MODE === "1"
+        liveMode: process.env.LIVE_ORDER_MODE === "1",
+        lastPreflight: report.lastPreflight ?? null
       });
       return;
     }
@@ -71,6 +73,21 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (method === "POST" && url.pathname === "/api/run/preflight") {
+      if (runningJob) {
+        json(res, 409, { error: `Job already running: ${runningJob}` });
+        return;
+      }
+      runningJob = "preflight";
+      void runPreflightPass()
+        .catch((err) => console.error("PREFLIGHT_JOB_FAIL", err))
+        .finally(() => {
+          runningJob = null;
+        });
+      json(res, 202, { accepted: true, job: "preflight" });
+      return;
+    }
+
     json(res, 404, { error: "Not found" });
   } catch (err) {
     console.error(err);
@@ -95,7 +112,11 @@ async function getDbReport() {
       orders: [],
       fills: [],
       positions: [],
-      managedPositions: []
+      managedPositions: [],
+      lastBrokerSyncAt: null,
+      lastPreflight: null,
+      latestAlerts: [],
+      latestReconcile: []
     };
   }
 
@@ -137,19 +158,53 @@ async function getDbReport() {
     const systemStateTable = await pool.query<{ exists: string | null }>(
       `SELECT to_regclass('public.system_state') AS exists`
     );
-    const lastSync =
+    const stateRows =
       systemStateTable.rows[0]?.exists
-        ? await pool.query<{ value: string }>(
-            `SELECT value FROM system_state WHERE key = 'last_broker_sync_at'`
+        ? await pool.query<{ key: string; value: string }>(
+            `SELECT key, value FROM system_state WHERE key IN ('last_broker_sync_at', 'last_preflight')`
           )
-        : { rows: [] as Array<{ value: string }> };
+        : { rows: [] as Array<{ key: string; value: string }> };
+    const stateMap = new Map(stateRows.rows.map((r) => [r.key, r.value]));
+
+    const alertsTable = await pool.query<{ exists: string | null }>(
+      `SELECT to_regclass('public.alert_events') AS exists`
+    );
+    const latestAlerts =
+      alertsTable.rows[0]?.exists
+        ? await pool.query(
+            `
+            SELECT id, severity, type, message, created_at
+            FROM alert_events
+            ORDER BY created_at DESC
+            LIMIT 10
+            `
+          )
+        : { rows: [] as any[] };
+
+    const reconcileTable = await pool.query<{ exists: string | null }>(
+      `SELECT to_regclass('public.reconcile_audit') AS exists`
+    );
+    const latestReconcile =
+      reconcileTable.rows[0]?.exists
+        ? await pool.query(
+            `
+            SELECT id, run_id, drift_count, created_at
+            FROM reconcile_audit
+            ORDER BY created_at DESC
+            LIMIT 10
+            `
+          )
+        : { rows: [] as any[] };
     return {
       dbEnabled: true,
       orders: orders.rows,
       fills: fills.rows,
       positions: positions.rows,
       managedPositions: managed.rows,
-      lastBrokerSyncAt: lastSync.rows[0]?.value ?? null
+      lastBrokerSyncAt: stateMap.get("last_broker_sync_at") ?? null,
+      lastPreflight: stateMap.get("last_preflight") ?? null,
+      latestAlerts: latestAlerts.rows,
+      latestReconcile: latestReconcile.rows
     };
   } catch (err) {
     maybeLogDbError(err);
@@ -160,7 +215,10 @@ async function getDbReport() {
       fills: [],
       positions: [],
       managedPositions: [],
-      lastBrokerSyncAt: null
+      lastBrokerSyncAt: null,
+      lastPreflight: null,
+      latestAlerts: [],
+      latestReconcile: []
     };
   } finally {
     await pool.end();
@@ -459,6 +517,7 @@ function htmlPage() {
       <div class="toolbar">
         <button id="morningBtn" class="btn-main">Run Morning</button>
         <button id="monitorBtn" class="btn-soft">Run Monitor</button>
+        <button id="preflightBtn" class="btn-soft">Run Preflight</button>
         <button id="refreshBtn" class="btn-soft">Refresh</button>
       </div>
       <div class="grid4">
@@ -502,12 +561,17 @@ function htmlPage() {
         <div id="strategySummary" class="meta">Loading...</div>
         <div id="strategyBySymbol" style="margin-top:8px;"></div>
       </section>
+      <section class="card wide">
+        <h2>Ops Events</h2>
+        <div id="opsEvents"></div>
+      </section>
     </div>
   </div>
   <script>
     const statusEl = document.getElementById("status");
     const morningBtn = document.getElementById("morningBtn");
     const monitorBtn = document.getElementById("monitorBtn");
+    const preflightBtn = document.getElementById("preflightBtn");
     const refreshBtn = document.getElementById("refreshBtn");
     const heroSub = document.querySelector(".hero-sub");
     const kpiPositions = document.getElementById("kpiPositions");
@@ -516,9 +580,11 @@ function htmlPage() {
     const kpiFills = document.getElementById("kpiFills");
     const strategySummary = document.getElementById("strategySummary");
     const strategyBySymbol = document.getElementById("strategyBySymbol");
+    const opsEvents = document.getElementById("opsEvents");
 
     morningBtn.onclick = () => trigger("/api/run/morning");
     monitorBtn.onclick = () => trigger("/api/run/monitor");
+    preflightBtn.onclick = () => trigger("/api/run/preflight");
     refreshBtn.onclick = () => load();
 
     async function trigger(path) {
@@ -548,10 +614,12 @@ function htmlPage() {
         const syncText = report.lastBrokerSyncAt
           ? ('Last broker sync: ' + new Date(report.lastBrokerSyncAt).toLocaleString('en-IN'))
           : 'Last broker sync: n/a';
-        heroSub.textContent = modeText + ' | ' + syncText;
+        const preflightText = status.lastPreflight ? 'Preflight: OK' : 'Preflight: n/a';
+        heroSub.textContent = modeText + ' | ' + syncText + ' | ' + preflightText;
       }
       morningBtn.disabled = !!status.runningJob;
       monitorBtn.disabled = !!status.runningJob;
+      preflightBtn.disabled = !!status.runningJob;
 
       kpiPositions.textContent = String((report.positions || []).length);
       kpiStops.textContent = String((report.managedPositions || []).length);
@@ -563,6 +631,7 @@ function htmlPage() {
       render("orders", report.orders, ["order_id", "symbol", "side", "qty", "state", "avg_fill_price", "updated_at"]);
       render("fills", report.fills, ["order_id", "symbol", "side", "qty", "price", "fill_time"]);
       renderStrategy(strategy);
+      renderOps(report);
     }
 
     function render(id, rows, columns) {
@@ -634,6 +703,18 @@ function htmlPage() {
 
     function inr(v) {
       return new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 2 }).format(Number(v || 0));
+    }
+
+    function renderOps(report) {
+      const alerts = report.latestAlerts || [];
+      const reconcile = report.latestReconcile || [];
+      const alertRows = alerts.map(a => '<tr><td>' + new Date(a.created_at).toLocaleString('en-IN') + '</td><td>' + a.severity + '</td><td>' + a.type + '</td><td>' + a.message + '</td></tr>').join('');
+      const recRows = reconcile.map(r => '<tr><td>' + new Date(r.created_at).toLocaleString('en-IN') + '</td><td>' + r.run_id + '</td><td>' + r.drift_count + '</td></tr>').join('');
+      opsEvents.innerHTML =
+        '<div class=\"meta\" style=\"margin-bottom:8px;\">Latest alerts and reconcile audits</div>' +
+        '<table><tr><th>time</th><th>severity</th><th>type</th><th>message</th></tr>' + (alertRows || '<tr><td colspan=\"4\" class=\"empty\">No alerts</td></tr>') + '</table>' +
+        '<div style=\"height:10px;\"></div>' +
+        '<table><tr><th>time</th><th>run</th><th>drift</th></tr>' + (recRows || '<tr><td colspan=\"3\" class=\"empty\">No reconcile audits</td></tr>') + '</table>';
     }
 
     load();

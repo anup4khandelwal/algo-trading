@@ -29,6 +29,23 @@ export interface DailySnapshot {
   createdAt: string;
 }
 
+export interface AlertEvent {
+  id: number;
+  severity: "info" | "warning" | "critical";
+  type: string;
+  message: string;
+  contextJson?: string;
+  createdAt: string;
+}
+
+export interface ReconcileAudit {
+  id: number;
+  runId: string;
+  driftCount: number;
+  detailsJson?: string;
+  createdAt: string;
+}
+
 export interface Persistence {
   init(): Promise<void>;
   upsertOrder(order: Order): Promise<void>;
@@ -57,6 +74,10 @@ export interface Persistence {
   loadDailySnapshots(limit: number): Promise<DailySnapshot[]>;
   upsertSystemState(key: string, value: string): Promise<void>;
   loadSystemState(key: string): Promise<string | null>;
+  insertAlertEvent(event: Omit<AlertEvent, "id" | "createdAt">): Promise<void>;
+  loadLatestAlertEvents(limit: number): Promise<AlertEvent[]>;
+  insertReconcileAudit(audit: Omit<ReconcileAudit, "id" | "createdAt">): Promise<void>;
+  loadLatestReconcileAudits(limit: number): Promise<ReconcileAudit[]>;
 }
 
 export class NoopPersistence implements Persistence {
@@ -96,5 +117,15 @@ export class NoopPersistence implements Persistence {
   async upsertSystemState(_key: string, _value: string): Promise<void> {}
   async loadSystemState(_key: string): Promise<string | null> {
     return null;
+  }
+  async insertAlertEvent(_event: Omit<AlertEvent, "id" | "createdAt">): Promise<void> {}
+  async loadLatestAlertEvents(_limit: number): Promise<AlertEvent[]> {
+    return [];
+  }
+  async insertReconcileAudit(
+    _audit: Omit<ReconcileAudit, "id" | "createdAt">
+  ): Promise<void> {}
+  async loadLatestReconcileAudits(_limit: number): Promise<ReconcileAudit[]> {
+    return [];
   }
 }

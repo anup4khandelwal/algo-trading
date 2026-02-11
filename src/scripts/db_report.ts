@@ -72,6 +72,36 @@ async function main() {
         ? await pool.query(`SELECT key, value, updated_at FROM system_state ORDER BY key`)
         : { rowCount: 0, rows: [] as any[] };
 
+    const alertTable = await pool.query<{ exists: string | null }>(
+      `SELECT to_regclass('public.alert_events') AS exists`
+    );
+    const alerts =
+      alertTable.rows[0]?.exists
+        ? await pool.query(
+            `
+            SELECT id, severity, type, message, created_at
+            FROM alert_events
+            ORDER BY created_at DESC
+            LIMIT 10
+            `
+          )
+        : { rowCount: 0, rows: [] as any[] };
+
+    const reconcileTable = await pool.query<{ exists: string | null }>(
+      `SELECT to_regclass('public.reconcile_audit') AS exists`
+    );
+    const reconcile =
+      reconcileTable.rows[0]?.exists
+        ? await pool.query(
+            `
+            SELECT id, run_id, drift_count, details_json, created_at
+            FROM reconcile_audit
+            ORDER BY created_at DESC
+            LIMIT 10
+            `
+          )
+        : { rowCount: 0, rows: [] as any[] };
+
     console.log("=== DB REPORT ===");
     console.log(`orders(last10): ${orders.rowCount ?? 0}`);
     for (const row of orders.rows) {
@@ -111,6 +141,20 @@ async function main() {
     console.log(`system_state: ${systemState.rowCount ?? 0}`);
     for (const row of systemState.rows) {
       console.log(`  ${row.key}=${row.value} | updated=${row.updated_at.toISOString()}`);
+    }
+
+    console.log(`alert_events(last10): ${alerts.rowCount ?? 0}`);
+    for (const row of alerts.rows) {
+      console.log(
+        `  ${row.created_at.toISOString()} | ${row.severity} | ${row.type} | ${row.message}`
+      );
+    }
+
+    console.log(`reconcile_audit(last10): ${reconcile.rowCount ?? 0}`);
+    for (const row of reconcile.rows) {
+      console.log(
+        `  ${row.created_at.toISOString()} | ${row.run_id} | drift=${row.drift_count} | details=${row.details_json ?? ""}`
+      );
     }
   } catch (err) {
     console.error("DB_REPORT_FAIL: Unable to query database");
