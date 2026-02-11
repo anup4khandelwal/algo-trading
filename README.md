@@ -32,6 +32,9 @@ This repository is a TypeScript-based swing-trading platform for NSE equities wi
 
 ## Setup Guide
 
+Detailed usage manual:
+- `docs/TRADER_GUIDE.md`
+
 ## 1) Prerequisites
 - Node.js 20+
 - PostgreSQL 16+
