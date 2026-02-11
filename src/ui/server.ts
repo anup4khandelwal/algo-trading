@@ -294,6 +294,12 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (method === "POST" && url.pathname === "/api/funds/recompute") {
+      const snapshot = await recomputeFundsSnapshot();
+      json(res, 200, { ok: true, funds: snapshot });
+      return;
+    }
+
     if (method === "POST" && url.pathname === "/api/scheduler/start") {
       if (getSafeModeState().enabled) {
         json(res, 409, { error: "Safe Mode is enabled. Disable it before starting scheduler." });
@@ -756,6 +762,17 @@ async function getDbReport() {
       } catch {
         funds = null;
       }
+    }
+    if (process.env.LIVE_ORDER_MODE !== "1") {
+      const availableCash = Number(process.env.STARTING_EQUITY ?? "1000000");
+      const fundUsagePct = clamp01(Number(process.env.FUND_USAGE_PCT ?? "0.95"));
+      funds = {
+        availableCash,
+        usableEquity: Math.max(0, availableCash * fundUsagePct),
+        fundUsagePct,
+        source: "paper",
+        updatedAt: new Date().toISOString()
+      };
     }
     const fundsHistoryRaw = stateMap.get("funds_history");
     let fundsHistory: Array<{
@@ -1633,6 +1650,17 @@ async function getLastEodSummary() {
 }
 
 async function loadFundsState(databaseUrl: string | undefined) {
+  if (process.env.LIVE_ORDER_MODE !== "1") {
+    const availableCash = Number(process.env.STARTING_EQUITY ?? "1000000");
+    const fundUsagePct = clamp01(Number(process.env.FUND_USAGE_PCT ?? "0.95"));
+    return {
+      availableCash,
+      usableEquity: Math.max(0, availableCash * fundUsagePct),
+      fundUsagePct,
+      source: "paper",
+      updatedAt: new Date().toISOString()
+    };
+  }
   if (!databaseUrl) {
     return null;
   }
@@ -1664,6 +1692,110 @@ async function loadFundsState(databaseUrl: string | undefined) {
   } finally {
     await pool.end();
   }
+}
+
+async function recomputeFundsSnapshot() {
+  const nowIso = new Date().toISOString();
+  let snapshot: {
+    availableCash: number;
+    usableEquity: number;
+    fundUsagePct: number;
+    source: string;
+    updatedAt: string;
+  };
+  const fundUsagePct = clamp01(Number(process.env.FUND_USAGE_PCT ?? "0.95"));
+  if (process.env.LIVE_ORDER_MODE === "1") {
+    const apiKey = process.env.KITE_API_KEY;
+    const accessToken = process.env.KITE_ACCESS_TOKEN;
+    if (!apiKey || !accessToken) {
+      throw new Error("KITE_API_KEY and KITE_ACCESS_TOKEN are required for live funds refresh");
+    }
+    const exec = new ZerodhaAdapter(new MapLtpProvider(new Map([["NIFTYBEES", 1]])), {
+      mode: "live",
+      apiKey,
+      accessToken,
+      exchange: process.env.KITE_EXCHANGE ?? "NSE",
+      product: process.env.KITE_PRODUCT ?? "CNC"
+    });
+    const broker = await exec.fetchAvailableFunds();
+    const availableCash = Math.max(0, Number(broker.availableCash ?? 0));
+    snapshot = {
+      availableCash,
+      usableEquity: Math.max(0, availableCash * fundUsagePct),
+      fundUsagePct,
+      source: broker.source ?? "broker",
+      updatedAt: nowIso
+    };
+  } else {
+    const availableCash = Math.max(0, Number(process.env.STARTING_EQUITY ?? "1000000"));
+    snapshot = {
+      availableCash,
+      usableEquity: Math.max(0, availableCash * fundUsagePct),
+      fundUsagePct,
+      source: "paper",
+      updatedAt: nowIso
+    };
+  }
+
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) {
+    return snapshot;
+  }
+  const persistence = new PostgresPersistence(databaseUrl);
+  try {
+    await persistence.init();
+    await persistence.upsertSystemState("last_available_funds", JSON.stringify(snapshot));
+    const historyRaw = await persistence.loadSystemState("funds_history");
+    let history: Array<{
+      ts: string;
+      availableCash: number;
+      usableEquity: number;
+      source: string;
+    }> = [];
+    if (historyRaw) {
+      try {
+        const parsed = JSON.parse(historyRaw) as Array<{
+          ts?: string;
+          availableCash?: number;
+          usableEquity?: number;
+          source?: string;
+        }>;
+        if (Array.isArray(parsed)) {
+          history = parsed
+            .map((x) => ({
+              ts: String(x.ts ?? ""),
+              availableCash: Number(x.availableCash ?? 0),
+              usableEquity: Number(x.usableEquity ?? 0),
+              source: String(x.source ?? "unknown")
+            }))
+            .filter((x) => x.ts.length > 0);
+        }
+      } catch {
+        history = [];
+      }
+    }
+    const point = {
+      ts: nowIso,
+      availableCash: snapshot.availableCash,
+      usableEquity: snapshot.usableEquity,
+      source: snapshot.source
+    };
+    history.push(point);
+    if (history.length > 400) {
+      history = history.slice(history.length - 400);
+    }
+    await persistence.upsertSystemState("funds_history", JSON.stringify(history));
+  } catch (err) {
+    pushRuntimeError("FUNDS_RECOMPUTE", err);
+  }
+  return snapshot;
+}
+
+function clamp01(v: number) {
+  if (!Number.isFinite(v)) {
+    return 0;
+  }
+  return Math.min(1, Math.max(0, v));
 }
 
 async function notifyOpsAlert(

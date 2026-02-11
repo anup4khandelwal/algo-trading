@@ -589,6 +589,7 @@ export default function App() {
         <button disabled={busy} onClick={() => void postAction("/api/run/eod")} className="btn">EOD</button>
         <button disabled={busy} onClick={() => void postAction("/api/run/backtest")} className="btn">Backtest</button>
         <button disabled={busy} onClick={() => void postAction("/api/strategy-lab/run")} className="btn">Strategy Lab</button>
+        <button disabled={busy} onClick={() => void postAction("/api/funds/recompute")} className="btn">Recompute Funds</button>
         <button disabled={busy || safeModeOn} onClick={() => void postAction("/api/scheduler/start")} className="btn">Start Scheduler</button>
         <button disabled={busy} onClick={() => void postAction("/api/scheduler/stop")} className="btn">Stop Scheduler</button>
         <button disabled={busy || safeModeOn} onClick={() => void postAction("/api/safe-mode/enable", { reason: "React dashboard toggle" })} className="btn btn-danger">Enable Safe Mode</button>
@@ -597,7 +598,7 @@ export default function App() {
       </section>
 
       <section className="kpis">
-        <Kpi label="Usable Funds" value={report.funds ? inr(report.funds.usableEquity) : "n/a"} />
+        <Kpi label={`Usable Funds (${report.funds?.source ?? "n/a"})`} value={report.funds ? inr(report.funds.usableEquity) : "n/a"} />
         <Kpi label="Available Cash" value={report.funds ? inr(report.funds.availableCash) : "n/a"} />
         <Kpi label="Open Positions" value={String(report.positions?.length ?? 0)} />
         <Kpi label="Managed Stops" value={String(report.managedPositions?.length ?? 0)} />

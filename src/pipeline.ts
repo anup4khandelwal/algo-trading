@@ -454,6 +454,7 @@ async function createRuntime() {
   const fundUsagePct = clamp01(Number(process.env.FUND_USAGE_PCT ?? "0.95"));
   let fundSource: "broker" | "paper" = "paper";
   let availableCash = store.equity;
+  store.equity = Math.max(0, availableCash * fundUsagePct);
   if (exec.isLiveMode()) {
     try {
       const funds = await exec.fetchAvailableFunds();
