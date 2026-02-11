@@ -192,6 +192,8 @@ body {
 .row strong {
   font-family: "IBM Plex Mono", monospace;
   font-size: 12px;
+  white-space: normal;
+  text-align: right;
 }
 
 .meta-line {

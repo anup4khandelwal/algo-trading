@@ -19,6 +19,11 @@ import { TradingScheduler } from "../ops/scheduler.js";
 import { ZerodhaAdapter } from "../execution/zerodha_adapter.js";
 import { MapLtpProvider } from "../market_data/ltp_provider.js";
 import { buildAlerter } from "../ops/alerter.js";
+import {
+  applyProfile,
+  getProfileSnapshot,
+  type ProfileName
+} from "../config/profile_manager.js";
 
 dotenv.config();
 
@@ -52,8 +57,14 @@ type BrokerOrderFilter = {
   severity: "all" | "critical" | "warning" | "info";
   search: string;
 };
+type PreopenChecklist = {
+  ok: boolean;
+  checkedAt: string;
+  checks: Array<{ key: string; ok: boolean; message: string }>;
+};
 let runningJob: UiJob | null = null;
 let lastDbErrorLogAt = 0;
+let lastTokenRiskAlertAt = 0;
 const runtimeErrors: Array<{ time: string; source: string; message: string }> = [];
 let safeModeState: SafeModeState = {
   enabled: process.env.HALT_TRADING === "1",
@@ -136,6 +147,12 @@ const server = http.createServer(async (req, res) => {
     if (method === "GET" && url.pathname === "/api/health") {
       const health = await getHealthReport();
       json(res, 200, health);
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/api/preopen-check") {
+      const preopen = await getPreopenChecklist();
+      json(res, 200, preopen);
       return;
     }
 
@@ -271,6 +288,49 @@ const server = http.createServer(async (req, res) => {
       const reason = String(body?.reason ?? "manual ui toggle").trim();
       await setSafeMode(false, reason || "manual ui toggle", "ui");
       json(res, 200, { ok: true, safeMode: getSafeModeState(), scheduler: scheduler.getState() });
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/api/profile/status") {
+      const profile = await getProfileSnapshot();
+      json(res, 200, profile);
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/api/profile/recommendation") {
+      const recommendation = await getProfileRecommendation();
+      json(res, 200, recommendation);
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/api/eod-summary") {
+      const summary = await getLastEodSummary();
+      json(res, 200, summary);
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/api/profile/switch") {
+      const body = await readJsonBody(req);
+      const profile = String(body?.profile ?? "").trim().toLowerCase() as ProfileName;
+      const reason = String(body?.reason ?? "manual profile switch").trim();
+      if (!["phase1", "phase2", "phase3"].includes(profile)) {
+        json(res, 400, { error: "profile must be one of phase1, phase2, phase3" });
+        return;
+      }
+      const applied = await applyProfile(profile);
+      scheduler.stop();
+      await setSafeMode(true, `Profile switched to ${profile}: ${reason}`, "profile_switch");
+      await notifyOpsAlert("warning", "profile_switched", `Profile switched to ${profile}`, {
+        reason,
+        profile,
+        appliedAt: applied.updatedAt
+      });
+      json(res, 200, {
+        ok: true,
+        applied,
+        safeMode: getSafeModeState(),
+        scheduler: scheduler.getState()
+      });
       return;
     }
 
@@ -514,12 +574,29 @@ async function runUiJob(job: UiJob, logTag: string, runner: () => Promise<unknow
   if (runningJob) {
     throw new Error(`Job already running: ${runningJob}`);
   }
+  if (job === "morning") {
+    const preopen = await getPreopenChecklist();
+    if (!preopen.ok) {
+      const reason = preopen.checks
+        .filter((x) => !x.ok)
+        .map((x) => `${x.key}: ${x.message}`)
+        .join(" | ");
+      throw new Error(`Pre-open checklist failed: ${reason}`);
+    }
+  }
   runningJob = job;
   try {
     await runner();
+    if (job === "eod_close") {
+      await generateAndNotifyEodSummary();
+    }
   } catch (err) {
     console.error(`${logTag}_FAIL`, err);
     pushRuntimeError(logTag, err);
+    await notifyOpsAlert("critical", "ui_job_failed", `${logTag} failed`, {
+      job,
+      error: err instanceof Error ? err.message : String(err)
+    });
     throw err;
   } finally {
     runningJob = null;
@@ -1036,6 +1113,9 @@ async function getHealthReport() {
   const schedulerState = scheduler.getState();
   const token = getTokenLifetimeEstimate();
   const funds = await loadFundsState(databaseUrl);
+  const preopen = await getPreopenChecklist();
+
+  await maybeSendTokenRiskAlert(token);
 
   let latestAlertErrors: Array<{ time: string; type: string; message: string }> = [];
   if (databaseUrl) {
@@ -1092,6 +1172,7 @@ async function getHealthReport() {
     broker,
     token,
     funds,
+    preopen,
     safeMode: getSafeModeState(),
     scheduler: {
       enabled: schedulerState.enabled,
@@ -1099,6 +1180,268 @@ async function getHealthReport() {
     },
     errors
   };
+}
+
+async function getProfileRecommendation() {
+  const [profile, strategy, drift, health, report] = await Promise.all([
+    getProfileSnapshot(),
+    getStrategyReport(),
+    getDriftReport(),
+    getHealthReport(),
+    getDbReport()
+  ]);
+
+  const reasons: string[] = [];
+  const blockers: string[] = [];
+  let score = 0;
+
+  if (health.db?.status === "ok") {
+    score += 15;
+    reasons.push("DB health is stable");
+  } else {
+    blockers.push("DB health is not OK");
+  }
+
+  if (health.broker?.status === "ok" || health.broker?.status === "paper") {
+    score += 15;
+    reasons.push("Broker connectivity is healthy");
+  } else {
+    blockers.push("Broker health is down");
+  }
+
+  const closedLots = Number(strategy.closedLots ?? 0);
+  if (closedLots >= 40) {
+    score += 20;
+    reasons.push("Sufficient trade sample (>=40)");
+  } else if (closedLots >= 20) {
+    score += 12;
+    reasons.push("Moderate trade sample (>=20)");
+  } else {
+    blockers.push("Not enough closed trades (<20)");
+  }
+
+  const winRate = Number(strategy.winRate ?? 0);
+  if (winRate >= 0.52) {
+    score += 12;
+    reasons.push("Win rate is strong");
+  } else if (winRate >= 0.45) {
+    score += 7;
+    reasons.push("Win rate is acceptable");
+  } else {
+    score -= 10;
+    reasons.push("Win rate is weak");
+  }
+
+  const avgR = Number(strategy.avgR ?? 0);
+  if (avgR >= 0.6) {
+    score += 12;
+    reasons.push("Avg R is strong");
+  } else if (avgR >= 0.2) {
+    score += 7;
+    reasons.push("Avg R is acceptable");
+  } else {
+    score -= 10;
+    reasons.push("Avg R is weak");
+  }
+
+  const driftAlerts = Number(drift.summary?.alerts ?? 0);
+  if (drift.enabled && driftAlerts === 0) {
+    score += 12;
+    reasons.push("No drift alerts");
+  } else if (driftAlerts > 0) {
+    score -= Math.min(12, driftAlerts * 2);
+    reasons.push(`Drift alerts present (${driftAlerts})`);
+  }
+
+  const blocked = Object.keys(report.rejectGuard?.blockedSymbols ?? {}).length;
+  if (blocked === 0) {
+    score += 8;
+    reasons.push("No reject-guard blocks today");
+  } else {
+    score -= Math.min(10, blocked * 2);
+    reasons.push(`Reject-guard blocked symbols (${blocked})`);
+  }
+
+  const safeMode = getSafeModeState();
+  if (safeMode.enabled) {
+    reasons.push("Safe Mode is currently ON");
+  }
+
+  let recommended: ProfileName = "phase1";
+  if (blockers.length > 0 || score < 45) {
+    recommended = "phase1";
+  } else if (score < 72) {
+    recommended = "phase2";
+  } else {
+    recommended = "phase3";
+  }
+
+  return {
+    activeProfile: profile.activeProfile,
+    recommendedProfile: recommended,
+    score,
+    reasons,
+    blockers,
+    autoSwitchAllowed: blockers.length === 0,
+    generatedAt: new Date().toISOString()
+  };
+}
+
+async function getPreopenChecklist(): Promise<PreopenChecklist> {
+  const checks: PreopenChecklist["checks"] = [];
+  const liveMode = process.env.LIVE_ORDER_MODE === "1";
+  const db = await checkDbHealth(process.env.DATABASE_URL);
+  checks.push({
+    key: "db",
+    ok: db.status === "ok",
+    message: db.message
+  });
+
+  const broker = await checkBrokerHealth();
+  checks.push({
+    key: "broker",
+    ok: broker.status === "ok" || (!liveMode && broker.status === "paper"),
+    message: broker.message
+  });
+
+  const token = getTokenLifetimeEstimate();
+  const tokenAlertMinutes = Number(process.env.TOKEN_EXPIRY_ALERT_MINUTES ?? "120");
+  const tokenOk =
+    !liveMode ||
+    (token.known === true &&
+      Number(token.timeLeftMs ?? 0) > Math.max(5, tokenAlertMinutes) * 60_000);
+  checks.push({
+    key: "token",
+    ok: tokenOk,
+    message:
+      token.known === true
+        ? `Token left: ${token.timeLeftHuman}`
+        : (token.message ?? "token unavailable")
+  });
+
+  const funds = await loadFundsState(process.env.DATABASE_URL);
+  const fundsOk =
+    !liveMode ||
+    (funds !== null &&
+      Number(funds.availableCash) > 0 &&
+      Number(funds.usableEquity) > 0);
+  checks.push({
+    key: "funds",
+    ok: fundsOk,
+    message:
+      funds !== null
+        ? `Available ${inrNum(funds.availableCash)} | Usable ${inrNum(funds.usableEquity)}`
+        : "funds snapshot missing"
+  });
+
+  const ok = checks.every((x) => x.ok);
+  return {
+    ok,
+    checkedAt: new Date().toISOString(),
+    checks
+  };
+}
+
+async function maybeSendTokenRiskAlert(token: ReturnType<typeof getTokenLifetimeEstimate>) {
+  const liveMode = process.env.LIVE_ORDER_MODE === "1";
+  if (!liveMode || !token.known) {
+    return;
+  }
+  const tokenAlertMinutes = Number(process.env.TOKEN_EXPIRY_ALERT_MINUTES ?? "120");
+  const thresholdMs = Math.max(5, tokenAlertMinutes) * 60_000;
+  if (Number(token.timeLeftMs ?? 0) > thresholdMs) {
+    return;
+  }
+  const now = Date.now();
+  if (now - lastTokenRiskAlertAt < 15 * 60_000) {
+    return;
+  }
+  lastTokenRiskAlertAt = now;
+  await notifyOpsAlert("warning", "token_expiry_risk", "Kite access token near expiry", {
+    timeLeft: token.timeLeftHuman,
+    expiresAt: token.expiresAt
+  });
+}
+
+async function generateAndNotifyEodSummary() {
+  const summary = await buildEodSummary();
+  await persistEodSummary(summary);
+  await notifyOpsAlert("info", "eod_summary", summary.text, {
+    generatedAt: summary.generatedAt,
+    fields: summary.fields
+  });
+}
+
+async function buildEodSummary() {
+  const [report, drift, recommendation] = await Promise.all([
+    getDbReport(),
+    getDriftReport(),
+    getProfileRecommendation()
+  ]);
+  const snapshots = report.dailySnapshots ?? [];
+  const latestSnapshot =
+    snapshots.length > 0
+      ? snapshots.reduce((a: any, b: any) => (String(a.trade_date) > String(b.trade_date) ? a : b))
+      : null;
+  const today = getIstTradeDate();
+  const todayOrders = (report.orders ?? []).filter((o: any) => toIstDate(String(o.updated_at ?? "")) === today);
+  const todayFills = (report.fills ?? []).filter((f: any) => toIstDate(String(f.fill_time ?? "")) === today);
+  const blocked = Object.keys(report.rejectGuard?.blockedSymbols ?? {}).length;
+  const text =
+    `EOD Summary ${today} | orders=${todayOrders.length} fills=${todayFills.length}` +
+    ` | realized=${inrNum(Number(latestSnapshot?.realized_pnl ?? 0))}` +
+    ` | unrealized=${inrNum(Number(latestSnapshot?.unrealized_pnl ?? 0))}` +
+    ` | rejectBlocks=${blocked}` +
+    ` | driftAlerts=${Number(drift.summary?.alerts ?? 0)}` +
+    ` | recommendedProfile=${recommendation.recommendedProfile}` +
+    ` (score=${recommendation.score})`;
+  return {
+    generatedAt: new Date().toISOString(),
+    text,
+    fields: {
+      tradeDate: today,
+      orders: todayOrders.length,
+      fills: todayFills.length,
+      realizedPnl: Number(latestSnapshot?.realized_pnl ?? 0),
+      unrealizedPnl: Number(latestSnapshot?.unrealized_pnl ?? 0),
+      rejectBlocks: blocked,
+      driftAlerts: Number(drift.summary?.alerts ?? 0),
+      recommendedProfile: recommendation.recommendedProfile,
+      recommendationScore: recommendation.score
+    }
+  };
+}
+
+async function persistEodSummary(summary: { generatedAt: string; text: string; fields: Record<string, unknown> }) {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) {
+    return;
+  }
+  const persistence = new PostgresPersistence(databaseUrl);
+  try {
+    await persistence.init();
+    await persistence.upsertSystemState("last_eod_summary", JSON.stringify(summary));
+  } catch (err) {
+    pushRuntimeError("EOD_SUMMARY_PERSIST", err);
+  }
+}
+
+async function getLastEodSummary() {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) {
+    return { available: false, summary: null };
+  }
+  const persistence = new PostgresPersistence(databaseUrl);
+  try {
+    await persistence.init();
+    const raw = await persistence.loadSystemState("last_eod_summary");
+    if (!raw) {
+      return { available: false, summary: null };
+    }
+    return { available: true, summary: JSON.parse(raw) };
+  } catch {
+    return { available: false, summary: null };
+  }
 }
 
 async function loadFundsState(databaseUrl: string | undefined) {
@@ -1133,6 +1476,39 @@ async function loadFundsState(databaseUrl: string | undefined) {
   } finally {
     await pool.end();
   }
+}
+
+async function notifyOpsAlert(
+  severity: "info" | "warning" | "critical",
+  type: string,
+  message: string,
+  context?: unknown
+) {
+  const databaseUrl = process.env.DATABASE_URL;
+  let persistence: PostgresPersistence | NoopPersistence = new NoopPersistence();
+  if (databaseUrl) {
+    const pg = new PostgresPersistence(databaseUrl);
+    try {
+      await pg.init();
+      persistence = pg;
+    } catch {
+      persistence = new NoopPersistence();
+    }
+  }
+  try {
+    const alerter = buildAlerter(persistence);
+    await alerter.notify(severity, type, message, context);
+  } catch (err) {
+    pushRuntimeError("OPS_ALERT_NOTIFY", err);
+  }
+}
+
+function inrNum(value: number) {
+  return new Intl.NumberFormat("en-IN", {
+    style: "currency",
+    currency: "INR",
+    maximumFractionDigits: 2
+  }).format(Number(value ?? 0));
 }
 
 async function getBrokerOrdersReport(

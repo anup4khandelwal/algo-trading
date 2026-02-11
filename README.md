@@ -86,6 +86,37 @@ npm run ui
 ```
 When `dashboard/dist/index.html` exists, `npm run ui` serves React UI by default.
 
+## Profile Automation (Phase 1 / 2 / 3)
+- Profile templates are stored in:
+  - `profiles/phase1.env`
+  - `profiles/phase2.env`
+  - `profiles/phase3.env`
+- React dashboard includes **Risk Profile Automation** card:
+  - shows active profile, recommended profile, score, reasons, blockers
+  - one-click apply profile buttons (Phase 1/2/3)
+  - switching profile auto-enables Safe Mode and stops scheduler
+- profile templates ship with:
+  - `SCHEDULER_ENABLED=1`
+  - `HALT_TRADING=1` (safe by default pre-open)
+- API endpoints:
+  - `GET /api/profile/status`
+  - `GET /api/profile/recommendation`
+  - `POST /api/profile/switch` with `{ profile, reason }`
+
+## Daily Automation Safety Additions
+- **Pre-open checklist gate** blocks Morning run unless checks pass:
+  - DB health
+  - broker connectivity
+  - token validity window
+  - funds snapshot availability
+- API: `GET /api/preopen-check`
+- **Token expiry risk alert** sends Telegram warning when token time-left drops below:
+  - `TOKEN_EXPIRY_ALERT_MINUTES` (default `120`)
+- **Auto EOD summary** generated after EOD job:
+  - includes orders/fills, PnL snapshot, reject blocks, drift alerts, profile recommendation
+  - persisted in `system_state.last_eod_summary`
+  - API: `GET /api/eod-summary`
+
 ## Core Commands
 - `npm run morning`: daily workflow (`db:check -> reconcile -> demo -> db:report`)
 - `npm run live`: intraday loop mode

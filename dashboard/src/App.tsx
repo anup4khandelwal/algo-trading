@@ -152,6 +152,37 @@ type JournalPayload = {
   };
 };
 
+type ProfileStatusPayload = {
+  activeProfile: "phase1" | "phase2" | "phase3" | "custom";
+  availableProfiles: Array<"phase1" | "phase2" | "phase3">;
+  controls: Record<string, string>;
+};
+
+type ProfileRecommendationPayload = {
+  activeProfile: "phase1" | "phase2" | "phase3" | "custom";
+  recommendedProfile: "phase1" | "phase2" | "phase3";
+  score: number;
+  reasons: string[];
+  blockers: string[];
+  autoSwitchAllowed: boolean;
+  generatedAt: string;
+};
+
+type PreopenPayload = {
+  ok: boolean;
+  checkedAt: string;
+  checks: Array<{ key: string; ok: boolean; message: string }>;
+};
+
+type EodSummaryPayload = {
+  available: boolean;
+  summary: {
+    generatedAt: string;
+    text: string;
+    fields?: Record<string, unknown>;
+  } | null;
+};
+
 const fallbackStatus: StatusPayload = {
   runningJob: null,
   liveMode: false,
@@ -195,6 +226,22 @@ const fallbackJournal: JournalPayload = {
   closedLots: [],
   analytics: { bySetup: [], byWeekday: [], avgHoldDays: 0, topMistakes: [] }
 };
+const fallbackProfileStatus: ProfileStatusPayload = {
+  activeProfile: "custom",
+  availableProfiles: ["phase1", "phase2", "phase3"],
+  controls: {}
+};
+const fallbackProfileRec: ProfileRecommendationPayload = {
+  activeProfile: "custom",
+  recommendedProfile: "phase1",
+  score: 0,
+  reasons: [],
+  blockers: [],
+  autoSwitchAllowed: false,
+  generatedAt: new Date(0).toISOString()
+};
+const fallbackPreopen: PreopenPayload = { ok: false, checkedAt: new Date(0).toISOString(), checks: [] };
+const fallbackEodSummary: EodSummaryPayload = { available: false, summary: null };
 
 export default function App() {
   const [status, setStatus] = useState<StatusPayload>(fallbackStatus);
@@ -205,6 +252,10 @@ export default function App() {
   const [backtest, setBacktest] = useState<BacktestPayload>(fallbackBacktest);
   const [drift, setDrift] = useState<DriftPayload>(fallbackDrift);
   const [journal, setJournal] = useState<JournalPayload>(fallbackJournal);
+  const [profileStatus, setProfileStatus] = useState<ProfileStatusPayload>(fallbackProfileStatus);
+  const [profileRec, setProfileRec] = useState<ProfileRecommendationPayload>(fallbackProfileRec);
+  const [preopen, setPreopen] = useState<PreopenPayload>(fallbackPreopen);
+  const [eodSummary, setEodSummary] = useState<EodSummaryPayload>(fallbackEodSummary);
 
   const [busy, setBusy] = useState(false);
   const [lastRefresh, setLastRefresh] = useState<string>("");
@@ -246,7 +297,7 @@ export default function App() {
   }
 
   async function load() {
-    const [s, r, h, b, st, bt, dr, jr] = await Promise.all([
+    const [s, r, h, b, st, bt, dr, jr, ps, pr, po, eod] = await Promise.all([
       fetchJson<StatusPayload>("/api/status", fallbackStatus),
       fetchJson<ReportPayload>("/api/report", fallbackReport),
       fetchJson<HealthPayload>("/api/health", fallbackHealth),
@@ -254,7 +305,11 @@ export default function App() {
       fetchJson<StrategyPayload>("/api/strategy", fallbackStrategy),
       fetchJson<BacktestPayload>("/api/backtest", fallbackBacktest),
       fetchJson<DriftPayload>("/api/drift", fallbackDrift),
-      fetchJson<JournalPayload>("/api/journal", fallbackJournal)
+      fetchJson<JournalPayload>("/api/journal", fallbackJournal),
+      fetchJson<ProfileStatusPayload>("/api/profile/status", fallbackProfileStatus),
+      fetchJson<ProfileRecommendationPayload>("/api/profile/recommendation", fallbackProfileRec),
+      fetchJson<PreopenPayload>("/api/preopen-check", fallbackPreopen),
+      fetchJson<EodSummaryPayload>("/api/eod-summary", fallbackEodSummary)
     ]);
     setStatus(s);
     setReport(r);
@@ -264,6 +319,10 @@ export default function App() {
     setBacktest(bt);
     setDrift(dr);
     setJournal(jr);
+    setProfileStatus(ps);
+    setProfileRec(pr);
+    setPreopen(po);
+    setEodSummary(eod);
     setLastRefresh(new Date().toLocaleString("en-IN"));
     if (!exitSymbol && (r.positions?.length ?? 0) > 0) {
       setExitSymbol(r.positions?.[0]?.symbol ?? "");
@@ -382,6 +441,27 @@ export default function App() {
     }
   }
 
+  async function switchProfile(profile: "phase1" | "phase2" | "phase3") {
+    const ok = window.confirm(
+      `Switch to ${profile}? Scheduler will stop and Safe Mode will be enabled.`
+    );
+    if (!ok) return;
+    setBusy(true);
+    try {
+      await fetch("/api/profile/switch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          profile,
+          reason: "React one-click profile switch"
+        })
+      });
+      await load();
+    } finally {
+      setBusy(false);
+    }
+  }
+
   const eqPoints = useMemo(() => {
     const rows = [...(report.dailySnapshots ?? [])].reverse();
     if (rows.length < 2) return "";
@@ -439,7 +519,7 @@ export default function App() {
       </header>
 
       <section className="actions">
-        <button disabled={busy || safeModeOn} onClick={() => void postAction("/api/run/morning")} className="btn btn-primary">Morning</button>
+        <button disabled={busy || safeModeOn || !preopen.ok} onClick={() => void postAction("/api/run/morning")} className="btn btn-primary">Morning</button>
         <button disabled={busy} onClick={() => void postAction("/api/run/monitor")} className="btn">Monitor</button>
         <button disabled={busy} onClick={() => void postAction("/api/run/preflight")} className="btn">Preflight</button>
         <button disabled={busy} onClick={() => void postAction("/api/run/eod")} className="btn">EOD</button>
@@ -468,6 +548,33 @@ export default function App() {
             <Row label="Funds Source" value={report.funds?.source ?? "n/a"} />
             <Row label="Funds Updated" value={report.funds?.updatedAt ? new Date(report.funds.updatedAt).toLocaleString("en-IN") : "n/a"} />
           </div>
+        </Card>
+
+        <Card
+          title="Risk Profile Automation"
+          subtitle={`Active: ${profileStatus.activeProfile} | Recommended: ${profileRec.recommendedProfile}`}
+        >
+          <div className="meta-line">
+            Score: {profileRec.score} | Auto-switch: {profileRec.autoSwitchAllowed ? "YES" : "NO"} | Updated: {new Date(profileRec.generatedAt).toLocaleString("en-IN")}
+          </div>
+          <div className="actions-inline" style={{ marginBottom: 8 }}>
+            <button className="btn" disabled={busy} onClick={() => void switchProfile("phase1")}>Apply Phase 1</button>
+            <button className="btn" disabled={busy} onClick={() => void switchProfile("phase2")}>Apply Phase 2</button>
+            <button className="btn" disabled={busy} onClick={() => void switchProfile("phase3")}>Apply Phase 3</button>
+          </div>
+          <SimpleTable columns={["control", "value"]} rows={Object.entries(profileStatus.controls ?? {}).map(([k, v]) => [k, v])} />
+          <SimpleTable columns={["reasons"]} rows={(profileRec.reasons ?? []).map((x) => [x])} />
+          <SimpleTable columns={["blockers"]} rows={(profileRec.blockers ?? []).map((x) => [x])} />
+        </Card>
+
+        <Card title="Pre-Open Checklist" subtitle={`Checked: ${new Date(preopen.checkedAt).toLocaleString("en-IN")}`}>
+          <div className="meta-line">
+            Morning gate: {preopen.ok ? "PASS" : "BLOCKED"} (requires DB, broker, token, funds)
+          </div>
+          <SimpleTable
+            columns={["check", "status", "message"]}
+            rows={(preopen.checks ?? []).map((x) => [x.key, x.ok ? "OK" : "FAIL", x.message])}
+          />
         </Card>
 
         <Card title="Position Exit Console">
@@ -676,6 +783,22 @@ export default function App() {
             columns={["time", "run", "drift"]}
             rows={(report.latestReconcile ?? []).map((x) => [new Date(x.created_at).toLocaleString("en-IN"), x.run_id, String(x.drift_count)])}
           />
+        </Card>
+
+        <Card title="Last EOD Summary" span="wide">
+          {!eodSummary.available || !eodSummary.summary ? (
+            <div className="empty">No EOD summary generated yet</div>
+          ) : (
+            <>
+              <div className="meta-line">
+                Generated: {new Date(eodSummary.summary.generatedAt).toLocaleString("en-IN")}
+              </div>
+              <div className="row">
+                <span>Summary</span>
+                <strong>{eodSummary.summary.text}</strong>
+              </div>
+            </>
+          )}
         </Card>
       </section>
     </div>
