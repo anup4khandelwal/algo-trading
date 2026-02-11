@@ -1,15 +1,42 @@
 import http from "node:http";
 import dotenv from "dotenv";
 import { Pool } from "pg";
-import { runMonitorPass, runMorningWorkflow, runPreflightPass } from "../pipeline.js";
+import {
+  runEodClosePass,
+  runMonitorPass,
+  runMorningWorkflow,
+  runPreflightPass
+} from "../pipeline.js";
 import { PostgresPersistence } from "../persistence/postgres_persistence.js";
 import { runConfiguredBacktest } from "../backtest/service.js";
+import { TradingScheduler } from "../ops/scheduler.js";
 
 dotenv.config();
 
 const PORT = Number(process.env.UI_PORT ?? "3000");
-let runningJob: "morning" | "monitor" | "preflight" | "backtest" | null = null;
+type UiJob = "morning" | "monitor" | "preflight" | "backtest" | "eod_close";
+let runningJob: UiJob | null = null;
 let lastDbErrorLogAt = 0;
+const scheduler = new TradingScheduler(
+  {
+    runMorning: () => runUiJob("morning", "SCHED_MORNING", () => runMorningWorkflow()),
+    runMonitor: () => runUiJob("monitor", "SCHED_MONITOR", () => runMonitorPass()),
+    runEodClose: () => runUiJob("eod_close", "SCHED_EOD", () => runEodClosePass()),
+    runBacktest: () => runUiJob("backtest", "SCHED_BACKTEST", () => runConfiguredBacktest()),
+    canRun: () => runningJob === null
+  },
+  {
+    tickSeconds: Number(process.env.SCHEDULER_TICK_SECONDS ?? "20"),
+    monitorIntervalSeconds: Number(process.env.SCHEDULER_MONITOR_INTERVAL_SECONDS ?? "300"),
+    premarketAt: process.env.SCHEDULER_PREMARKET_AT ?? "08:55",
+    eodAt: process.env.SCHEDULER_EOD_AT ?? "15:31",
+    backtestAt: process.env.SCHEDULER_BACKTEST_AT ?? "10:30",
+    backtestWeekday: process.env.SCHEDULER_BACKTEST_WEEKDAY ?? "Sat"
+  }
+);
+if (process.env.SCHEDULER_ENABLED === "1") {
+  scheduler.start();
+}
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -27,7 +54,16 @@ const server = http.createServer(async (req, res) => {
       json(res, 200, {
         runningJob,
         liveMode: process.env.LIVE_ORDER_MODE === "1",
-        lastPreflight: report.lastPreflight ?? null
+        lastPreflight: report.lastPreflight ?? null,
+        scheduler: scheduler.getState()
+      });
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/api/scheduler") {
+      json(res, 200, {
+        runningJob,
+        scheduler: scheduler.getState()
       });
       return;
     }
@@ -57,62 +93,49 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (method === "POST" && url.pathname === "/api/run/morning") {
-      if (runningJob) {
-        json(res, 409, { error: `Job already running: ${runningJob}` });
+      if (!launchJob(res, "morning", "MORNING_JOB", () => runMorningWorkflow())) {
         return;
       }
-      runningJob = "morning";
-      void runMorningWorkflow()
-        .catch((err) => console.error("MORNING_JOB_FAIL", err))
-        .finally(() => {
-          runningJob = null;
-        });
-      json(res, 202, { accepted: true, job: "morning" });
       return;
     }
 
     if (method === "POST" && url.pathname === "/api/run/monitor") {
-      if (runningJob) {
-        json(res, 409, { error: `Job already running: ${runningJob}` });
+      if (!launchJob(res, "monitor", "MONITOR_JOB", () => runMonitorPass())) {
         return;
       }
-      runningJob = "monitor";
-      void runMonitorPass()
-        .catch((err) => console.error("MONITOR_JOB_FAIL", err))
-        .finally(() => {
-          runningJob = null;
-        });
-      json(res, 202, { accepted: true, job: "monitor" });
       return;
     }
 
     if (method === "POST" && url.pathname === "/api/run/preflight") {
-      if (runningJob) {
-        json(res, 409, { error: `Job already running: ${runningJob}` });
+      if (!launchJob(res, "preflight", "PREFLIGHT_JOB", () => runPreflightPass())) {
         return;
       }
-      runningJob = "preflight";
-      void runPreflightPass()
-        .catch((err) => console.error("PREFLIGHT_JOB_FAIL", err))
-        .finally(() => {
-          runningJob = null;
-        });
-      json(res, 202, { accepted: true, job: "preflight" });
       return;
     }
 
     if (method === "POST" && url.pathname === "/api/run/backtest") {
-      if (runningJob) {
-        json(res, 409, { error: `Job already running: ${runningJob}` });
+      if (!launchJob(res, "backtest", "BACKTEST_JOB", () => runConfiguredBacktest())) {
         return;
       }
-      runningJob = "backtest";
-      void runConfiguredBacktest()
-        .catch((err) => console.error("BACKTEST_JOB_FAIL", err))
-        .finally(() => {
-          runningJob = null;
-        });
-      json(res, 202, { accepted: true, job: "backtest" });
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/api/run/eod") {
+      if (!launchJob(res, "eod_close", "EOD_JOB", () => runEodClosePass())) {
+        return;
+      }
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/api/scheduler/start") {
+      scheduler.start();
+      json(res, 200, { ok: true, scheduler: scheduler.getState() });
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/api/scheduler/stop") {
+      scheduler.stop();
+      json(res, 200, { ok: true, scheduler: scheduler.getState() });
       return;
     }
 
@@ -162,11 +185,44 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`UI server running at http://127.0.0.1:${PORT}`);
+  if (scheduler.isRunning()) {
+    console.log("SCHEDULER_ENABLED: started");
+  }
 });
 
 function json(res: http.ServerResponse, status: number, body: unknown) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(body));
+}
+
+function launchJob(
+  res: http.ServerResponse,
+  job: UiJob,
+  logTag: string,
+  runner: () => Promise<unknown>
+) {
+  if (runningJob) {
+    json(res, 409, { error: `Job already running: ${runningJob}` });
+    return false;
+  }
+  void runUiJob(job, logTag, runner);
+  json(res, 202, { accepted: true, job });
+  return true;
+}
+
+async function runUiJob(job: UiJob, logTag: string, runner: () => Promise<unknown>) {
+  if (runningJob) {
+    throw new Error(`Job already running: ${runningJob}`);
+  }
+  runningJob = job;
+  try {
+    await runner();
+  } catch (err) {
+    console.error(`${logTag}_FAIL`, err);
+    throw err;
+  } finally {
+    runningJob = null;
+  }
 }
 
 async function readJsonBody(req: http.IncomingMessage): Promise<any> {
@@ -745,9 +801,13 @@ function htmlPage() {
         <button id="morningBtn" class="btn-main">Run Morning</button>
         <button id="monitorBtn" class="btn-soft">Run Monitor</button>
         <button id="preflightBtn" class="btn-soft">Run Preflight</button>
+        <button id="eodBtn" class="btn-soft">Run EOD Close</button>
         <button id="backtestBtn" class="btn-soft">Run Backtest</button>
+        <button id="schedulerStartBtn" class="btn-soft">Start Scheduler</button>
+        <button id="schedulerStopBtn" class="btn-soft">Stop Scheduler</button>
         <button id="refreshBtn" class="btn-soft">Refresh</button>
       </div>
+      <div id="schedulerMeta" class="meta">Scheduler: loading...</div>
       <div class="grid4">
         <div class="kpi">
           <p class="kpi-label">Open Positions</p>
@@ -821,7 +881,11 @@ function htmlPage() {
     const morningBtn = document.getElementById("morningBtn");
     const monitorBtn = document.getElementById("monitorBtn");
     const preflightBtn = document.getElementById("preflightBtn");
+    const eodBtn = document.getElementById("eodBtn");
     const backtestBtn = document.getElementById("backtestBtn");
+    const schedulerStartBtn = document.getElementById("schedulerStartBtn");
+    const schedulerStopBtn = document.getElementById("schedulerStopBtn");
+    const schedulerMeta = document.getElementById("schedulerMeta");
     const refreshBtn = document.getElementById("refreshBtn");
     const heroSub = document.querySelector(".hero-sub");
     const kpiPositions = document.getElementById("kpiPositions");
@@ -847,14 +911,22 @@ function htmlPage() {
     morningBtn.onclick = () => trigger("/api/run/morning");
     monitorBtn.onclick = () => trigger("/api/run/monitor");
     preflightBtn.onclick = () => trigger("/api/run/preflight");
+    eodBtn.onclick = () => trigger("/api/run/eod");
     backtestBtn.onclick = () => trigger("/api/run/backtest");
+    schedulerStartBtn.onclick = () => trigger("/api/scheduler/start");
+    schedulerStopBtn.onclick = () => trigger("/api/scheduler/stop");
     refreshBtn.onclick = () => load();
     journalSaveBtn.onclick = () => saveJournalEntry();
 
     async function trigger(path) {
       const res = await fetch(path, { method: "POST" });
       const body = await res.json();
-      statusEl.textContent = res.ok ? ("Started: " + body.job) : (body.error || "Failed");
+      if (res.ok) {
+        const action = body.job ? ('Started: ' + body.job) : (body.ok ? 'Done' : 'Success');
+        statusEl.textContent = action;
+      } else {
+        statusEl.textContent = body.error || "Failed";
+      }
       await load();
     }
 
@@ -883,12 +955,28 @@ function htmlPage() {
           ? ('Last broker sync: ' + new Date(report.lastBrokerSyncAt).toLocaleString('en-IN'))
           : 'Last broker sync: n/a';
         const preflightText = status.lastPreflight ? 'Preflight: OK' : 'Preflight: n/a';
-        heroSub.textContent = modeText + ' | ' + syncText + ' | ' + preflightText;
+        const schedulerText = status.scheduler && status.scheduler.enabled ? 'Scheduler: ON' : 'Scheduler: OFF';
+        heroSub.textContent = modeText + ' | ' + syncText + ' | ' + preflightText + ' | ' + schedulerText;
       }
       morningBtn.disabled = !!status.runningJob;
       monitorBtn.disabled = !!status.runningJob;
       preflightBtn.disabled = !!status.runningJob;
+      eodBtn.disabled = !!status.runningJob;
       backtestBtn.disabled = !!status.runningJob;
+      schedulerStartBtn.disabled = !!status.runningJob || (status.scheduler && status.scheduler.enabled);
+      schedulerStopBtn.disabled = !!status.runningJob || !(status.scheduler && status.scheduler.enabled);
+
+      if (status.scheduler && schedulerMeta) {
+        const s = status.scheduler;
+        const last = s.lastRuns || {};
+        schedulerMeta.textContent =
+          'Scheduler: ' + (s.enabled ? 'running' : 'stopped') +
+          ' | premarket=' + s.premarketAt +
+          ' | monitor=' + s.monitorIntervalSeconds + 's' +
+          ' | eod=' + s.eodAt +
+          ' | backtest=' + s.backtestWeekday + ' ' + s.backtestAt +
+          ' | last morning=' + (last.morning ? new Date(last.morning).toLocaleString('en-IN') : 'n/a');
+      }
 
       kpiPositions.textContent = String((report.positions || []).length);
       kpiStops.textContent = String((report.managedPositions || []).length);

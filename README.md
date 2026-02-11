@@ -123,6 +123,19 @@ Results:
 npm run journal:export
 ```
 
+## UI Scheduler Automation
+From UI (`http://127.0.0.1:3000`) you can:
+- `Start Scheduler` / `Stop Scheduler`
+- run `Morning`, `Monitor`, `EOD Close`, and `Backtest` directly
+
+Scheduler env (optional):
+- `SCHEDULER_ENABLED=1` to auto-start with UI server
+- `SCHEDULER_PREMARKET_AT=08:55`
+- `SCHEDULER_MONITOR_INTERVAL_SECONDS=300`
+- `SCHEDULER_EOD_AT=15:31`
+- `SCHEDULER_BACKTEST_WEEKDAY=Sat`
+- `SCHEDULER_BACKTEST_AT=10:30`
+
 ## Recommended Daily Runbook
 1. Refresh token (`npm run auth`) before market open.
 2. Run `npm run morning`.

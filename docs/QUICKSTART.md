@@ -46,6 +46,7 @@ This runs:
 npm run ui
 ```
 Open `http://127.0.0.1:3000`.
+Use UI buttons to run morning/monitor/preflight/backtest/EOD and scheduler start/stop.
 
 ## 7) Optional live loop
 ```bash
