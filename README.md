@@ -167,9 +167,11 @@ Use these env controls before enabling live orders:
 - `GTT_PROTECTION_ENABLED=1` enables broker-native OCO protection (target + stop) after entry.
 - Optional payment gateway wiring for SaaS:
   - `PAYMENT_PROVIDER=none|stripe|razorpay`
-  - `PAYMENT_CHECKOUT_BASE_URL=<your hosted checkout url>`
+  - `PAYMENT_CHECKOUT_BASE_URL=<fallback hosted checkout url>`
   - `PAYMENT_SUCCESS_URL`, `PAYMENT_CANCEL_URL`
   - optional custom plans JSON: `PAYMENT_PLANS_JSON`
+  - Stripe native session creation: `STRIPE_SECRET_KEY` (+ optional `STRIPE_PUBLISHABLE_KEY`)
+  - Razorpay native payment link creation: `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`
 
 ## Backtest
 Set optional env (or keep defaults):

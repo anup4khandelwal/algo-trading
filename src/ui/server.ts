@@ -489,9 +489,9 @@ const server = http.createServer(async (req, res) => {
         json(res, 400, { ok: false, error: `Unknown plan: ${planId}` });
         return;
       }
-      const url = buildCheckoutUrl(cfg.provider, plan.id);
+      const url = await createProviderCheckoutSession(cfg, plan);
       if (!url) {
-        json(res, 400, { ok: false, error: "Checkout URL is not configured" });
+        json(res, 400, { ok: false, error: "Checkout URL/session is not configured" });
         return;
       }
       json(res, 200, { ok: true, url, provider: cfg.provider, planId: plan.id });
@@ -655,7 +655,9 @@ const ENV_SENSITIVE_KEYS = new Set([
   "KITE_API_SECRET",
   "KITE_ACCESS_TOKEN",
   "TELEGRAM_BOT_TOKEN",
-  "TELEGRAM_CHAT_ID"
+  "TELEGRAM_CHAT_ID",
+  "STRIPE_SECRET_KEY",
+  "RAZORPAY_KEY_SECRET"
 ]);
 
 const ENV_RESTART_REQUIRED_KEYS = new Set([
@@ -689,7 +691,16 @@ const ENV_DESCRIPTIONS: Record<string, string> = {
   STRATEGY_MAX_SIGNALS: "Maximum signals considered in one run.",
   STRATEGY_BREAKOUT_BUFFER_PCT: "How close to 20D high qualifies as breakout.",
   ATR_STOP_MULTIPLE: "Initial stop distance as ATR multiple.",
-  ATR_TRAILING_MULTIPLE: "Trailing stop ATR multiple in monitor loop."
+  ATR_TRAILING_MULTIPLE: "Trailing stop ATR multiple in monitor loop.",
+  PAYMENT_PROVIDER: "Payment gateway provider (none|stripe|razorpay).",
+  PAYMENT_CHECKOUT_BASE_URL: "Fallback hosted checkout URL.",
+  PAYMENT_SUCCESS_URL: "Redirect URL after successful payment.",
+  PAYMENT_CANCEL_URL: "Redirect URL after cancelled payment.",
+  PAYMENT_PLANS_JSON: "Optional JSON array to override default plans.",
+  STRIPE_PUBLISHABLE_KEY: "Stripe publishable key for frontend use.",
+  STRIPE_SECRET_KEY: "Stripe secret key for checkout session creation.",
+  RAZORPAY_KEY_ID: "Razorpay key id.",
+  RAZORPAY_KEY_SECRET: "Razorpay key secret."
 };
 
 function envCategory(key: string) {
@@ -737,7 +748,7 @@ function getBillingConfig(): BillingConfigPayload {
   const checkoutUrl = process.env.PAYMENT_CHECKOUT_BASE_URL;
   return {
     provider,
-    enabled: provider !== "none" && Boolean(checkoutUrl),
+    enabled: provider !== "none" && Boolean(checkoutUrl || provider === "stripe" || provider === "razorpay"),
     publishableKey: publishableKey || undefined,
     checkoutUrl: checkoutUrl || undefined,
     plans
@@ -794,6 +805,110 @@ function buildCheckoutUrl(provider: string, planId: string) {
   if (success) url.searchParams.set("success_url", success);
   if (cancel) url.searchParams.set("cancel_url", cancel);
   return url.toString();
+}
+
+async function createProviderCheckoutSession(
+  cfg: BillingConfigPayload,
+  plan: BillingConfigPayload["plans"][number]
+) {
+  if (cfg.provider === "stripe") {
+    return await createStripeCheckoutSession(plan);
+  }
+  if (cfg.provider === "razorpay") {
+    return await createRazorpayPaymentLink(plan);
+  }
+  return buildCheckoutUrl(cfg.provider, plan.id);
+}
+
+async function createStripeCheckoutSession(plan: BillingConfigPayload["plans"][number]) {
+  const secretKey = process.env.STRIPE_SECRET_KEY;
+  const successUrl = process.env.PAYMENT_SUCCESS_URL;
+  const cancelUrl = process.env.PAYMENT_CANCEL_URL;
+  if (!secretKey || !successUrl || !cancelUrl) {
+    return buildCheckoutUrl("stripe", plan.id);
+  }
+
+  const body = new URLSearchParams();
+  body.set("mode", "subscription");
+  body.set("success_url", successUrl);
+  body.set("cancel_url", cancelUrl);
+  body.set("line_items[0][quantity]", "1");
+  body.set("line_items[0][price_data][currency]", "inr");
+  body.set("line_items[0][price_data][recurring][interval]", normalizeInterval(plan.interval));
+  body.set("line_items[0][price_data][unit_amount]", String(Math.max(1, Math.round(plan.amountInr * 100))));
+  body.set("line_items[0][price_data][product_data][name]", `SwingTrader ${plan.name}`);
+  body.set("line_items[0][price_data][product_data][description]", `Plan ${plan.id}`);
+  body.set("metadata[plan_id]", plan.id);
+
+  const res = await fetch("https://api.stripe.com/v1/checkout/sessions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${secretKey}`,
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body: body.toString()
+  });
+  if (!res.ok) {
+    const raw = await res.text();
+    throw new Error(`Stripe checkout session failed ${res.status}: ${raw}`);
+  }
+  const parsed = (await res.json()) as { url?: string };
+  return parsed.url ?? "";
+}
+
+async function createRazorpayPaymentLink(plan: BillingConfigPayload["plans"][number]) {
+  const keyId = process.env.RAZORPAY_KEY_ID;
+  const keySecret = process.env.RAZORPAY_KEY_SECRET;
+  if (!keyId || !keySecret) {
+    return buildCheckoutUrl("razorpay", plan.id);
+  }
+
+  const callbackUrl = process.env.PAYMENT_SUCCESS_URL;
+  const payload: Record<string, unknown> = {
+    amount: Math.max(100, Math.round(plan.amountInr * 100)),
+    currency: "INR",
+    accept_partial: false,
+    description: `SwingTrader ${plan.name} (${plan.id})`,
+    customer: {
+      name: "SwingTrader User"
+    },
+    notify: {
+      sms: false,
+      email: false
+    },
+    reminder_enable: true,
+    notes: {
+      plan_id: plan.id
+    }
+  };
+  if (callbackUrl) {
+    payload.callback_url = callbackUrl;
+    payload.callback_method = "get";
+  }
+
+  const auth = Buffer.from(`${keyId}:${keySecret}`).toString("base64");
+  const res = await fetch("https://api.razorpay.com/v1/payment_links", {
+    method: "POST",
+    headers: {
+      Authorization: `Basic ${auth}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  });
+  if (!res.ok) {
+    const raw = await res.text();
+    throw new Error(`Razorpay payment link failed ${res.status}: ${raw}`);
+  }
+  const parsed = (await res.json()) as { short_url?: string };
+  return parsed.short_url ?? "";
+}
+
+function normalizeInterval(interval: string) {
+  const x = String(interval ?? "month").trim().toLowerCase();
+  if (x === "day" || x === "week" || x === "month" || x === "year") {
+    return x;
+  }
+  return "month";
 }
 
 async function hydrateSafeModeFromDb() {
