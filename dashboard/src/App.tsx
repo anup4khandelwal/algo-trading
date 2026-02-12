@@ -885,6 +885,19 @@ export default function App() {
                 </button>
               ))}
           </div>
+          <div className="meta-line" style={{ marginTop: 10 }}>Recent GTT Failures / Retry Logs</div>
+          <SimpleTable
+            columns={["symbol", "status", "updated", "errorLog"]}
+            rows={(gtt.rows ?? [])
+              .filter((x) => !!x.lastError || x.status === "failed")
+              .slice(0, 12)
+              .map((x) => [
+                x.symbol,
+                x.status,
+                new Date(x.updatedAt).toLocaleString("en-IN"),
+                x.lastError ?? ""
+              ])}
+          />
         </Card>
 
         <Card title="Strategy Analytics" span="wide">

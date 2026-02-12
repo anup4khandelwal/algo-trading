@@ -466,40 +466,50 @@ async function ensureLiveProtectionOrUnwind(
   const entryPrice = fill.price;
   const stopPrice = roundPx(signal.stopPrice);
   const targetPrice = roundPx(signal.targetPrice ?? signal.entryPrice + (signal.entryPrice - signal.stopPrice) * 2);
-  const ltp = await runtime.exec.getLtp(symbol);
-  try {
-    const gtt = await runtime.exec.createOcoGtt({
-      symbol,
-      qty,
-      lastPrice: ltp,
-      stopTrigger: stopPrice,
-      targetTrigger: targetPrice
-    });
-    await runtime.persistence.upsertGttProtection({
-      symbol,
-      qty,
-      entryPrice,
-      stopPrice,
-      targetPrice,
-      gttId: gtt.gttId,
-      status: "active"
-    });
-    return;
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    await runtime.persistence.upsertGttProtection({
-      symbol,
-      qty,
-      entryPrice,
-      stopPrice,
-      targetPrice,
-      gttId: "n/a",
-      status: "failed",
-      lastError: message.slice(0, 500)
-    });
-    await unwindPositionImmediately(runtime, symbol, qty, `GTT protect failed: ${message}`);
-    throw new Error(`Protection creation failed for ${symbol}; entry unwound. ${message}`);
+  const retries = Math.max(1, Number(process.env.GTT_CREATE_RETRIES ?? "2"));
+  const retryMs = Math.max(200, Number(process.env.GTT_CREATE_RETRY_MS ?? "800"));
+  const attemptErrors: string[] = [];
+  for (let attempt = 1; attempt <= retries; attempt += 1) {
+    try {
+      const ltp = await runtime.exec.getLtp(symbol);
+      const gtt = await runtime.exec.createOcoGtt({
+        symbol,
+        qty,
+        lastPrice: ltp,
+        stopTrigger: stopPrice,
+        targetTrigger: targetPrice
+      });
+      await runtime.persistence.upsertGttProtection({
+        symbol,
+        qty,
+        entryPrice,
+        stopPrice,
+        targetPrice,
+        gttId: gtt.gttId,
+        status: "active"
+      });
+      return;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      attemptErrors.push(`attempt ${attempt}/${retries}: ${message}`);
+      if (attempt < retries) {
+        await sleep(retryMs);
+      }
+    }
   }
+  const combined = attemptErrors.join(" | ");
+  await runtime.persistence.upsertGttProtection({
+    symbol,
+    qty,
+    entryPrice,
+    stopPrice,
+    targetPrice,
+    gttId: "n/a",
+    status: "failed",
+    lastError: combined.slice(0, 1000)
+  });
+  await unwindPositionImmediately(runtime, symbol, qty, `GTT protect failed: ${combined}`);
+  throw new Error(`Protection creation failed for ${symbol}; entry unwound. ${combined}`);
 }
 
 async function unwindPositionImmediately(

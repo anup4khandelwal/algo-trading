@@ -207,6 +207,9 @@ npm run journal:export
 ## Broker-Native GTT Protection
 - For live entries, app now creates a Zerodha GTT OCO (`two-leg`) immediately after BUY fill.
 - If GTT creation fails, entry is unwound immediately (safety-first block-entry behavior).
+- GTT create has retry controls:
+  - `GTT_CREATE_RETRIES` (default `2`)
+  - `GTT_CREATE_RETRY_MS` (default `800`)
 - New APIs:
   - `GET /api/gtt/status`
   - `POST /api/gtt/sync`

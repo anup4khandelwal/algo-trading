@@ -151,6 +151,7 @@ Use only as exception handling, not routine strategy override.
 - Use dashboard card **Broker Protections (GTT)** to:
   - sync broker/local statuses
   - cancel an active protection for a symbol (manual override)
+  - inspect exact broker error/retry logs in **Recent GTT Failures / Retry Logs**
 
 ## Broker Orderbook
 Detailed broker order feed with diagnostics.
