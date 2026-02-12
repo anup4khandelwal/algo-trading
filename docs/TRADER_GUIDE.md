@@ -230,7 +230,8 @@ In live mode:
 2. Computes:
 `usableEquity = availableCash * FUND_USAGE_PCT`
 3. Signals are sized from usable equity + risk-per-trade.
-4. During one run, app tracks remaining usable funds and skips unaffordable entries.
+4. Optional floor: `MIN_CAPITAL_DEPLOY_PCT` increases qty when risk sizing is too small for your preference.
+5. During one run, app tracks remaining usable funds and skips unaffordable entries.
 
 This reduces over-allocation risk.
 
@@ -238,6 +239,7 @@ This reduces over-allocation risk.
 Start with conservative values:
 - `FUND_USAGE_PCT=0.60-0.80`
 - `RISK_PER_TRADE=0.003-0.005`
+- `MIN_CAPITAL_DEPLOY_PCT=0.08-0.15` (optional floor for minimum deployment per trade)
 - `MAX_OPEN_POSITIONS=2-3`
 - `MAX_ORDERS_PER_DAY=3-4`
 - `ALLOWED_SYMBOLS` limited basket

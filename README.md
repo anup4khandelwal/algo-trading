@@ -148,6 +148,7 @@ Use these env controls before enabling live orders:
 - `MAX_NOTIONAL_PER_ORDER=...`
 - `STARTING_EQUITY=1000000` (paper-mode base equity)
 - `FUND_USAGE_PCT=0.95` (live: usable equity = available broker cash * this factor)
+- `MIN_CAPITAL_DEPLOY_PCT=0.10` (optional: enforce minimum notional deployment per eligible order)
 - `KITE_ORDER_VARIETY=regular|amo`
 - `KITE_ENABLE_AMO_FALLBACK=1` (auto-retry AMO if broker returns `switch_to_amo`)
 - `HALT_TRADING=1` to pause entries immediately
@@ -291,6 +292,7 @@ UI includes:
 - In live mode, app fetches broker funds (`/user/margins/equity`) and computes usable equity:
   - `usableEquity = availableCash * FUND_USAGE_PCT`
 - Signal sizing and order placement use this usable equity.
+- Quantity is risk-based by default (`RISK_PER_TRADE`), with optional floor via `MIN_CAPITAL_DEPLOY_PCT`.
 - During one run, app tracks remaining usable funds and skips entries that exceed remaining budget.
 - React dashboard shows:
   - current `available cash` vs `usable equity`

@@ -637,6 +637,7 @@ async function createRuntime() {
     breakoutBufferPct: Number(process.env.STRATEGY_BREAKOUT_BUFFER_PCT ?? "0.02"),
     atrStopMultiple: Number(process.env.ATR_STOP_MULTIPLE ?? "2"),
     riskPerTrade: riskLimits.riskPerTrade,
+    minCapitalDeployPct: Number(process.env.MIN_CAPITAL_DEPLOY_PCT ?? "0"),
     minAdv20: Number(process.env.STRATEGY_MIN_ADV20 ?? "100000000"),
     minVolumeRatio: Number(process.env.STRATEGY_MIN_VOLUME_RATIO ?? "1.2"),
     maxSignals: Number(process.env.STRATEGY_MAX_SIGNALS ?? "5")

@@ -26,6 +26,7 @@ export async function runConfiguredBacktest() {
       breakoutBufferPct: toNumber(process.env.STRATEGY_BREAKOUT_BUFFER_PCT),
       atrStopMultiple: toNumber(process.env.ATR_STOP_MULTIPLE),
       riskPerTrade: toNumber(process.env.RISK_PER_TRADE),
+      minCapitalDeployPct: toNumber(process.env.MIN_CAPITAL_DEPLOY_PCT),
       minAdv20: toNumber(process.env.STRATEGY_MIN_ADV20),
       minVolumeRatio: toNumber(process.env.STRATEGY_MIN_VOLUME_RATIO),
       maxSignals: toNumber(process.env.STRATEGY_MAX_SIGNALS)

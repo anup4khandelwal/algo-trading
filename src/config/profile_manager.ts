@@ -106,6 +106,7 @@ export async function getProfileSnapshot() {
       LIVE_ORDER_MODE: current.LIVE_ORDER_MODE ?? "0",
       FUND_USAGE_PCT: current.FUND_USAGE_PCT ?? "0.95",
       RISK_PER_TRADE: current.RISK_PER_TRADE ?? "0.015",
+      MIN_CAPITAL_DEPLOY_PCT: current.MIN_CAPITAL_DEPLOY_PCT ?? "0",
       MAX_DAILY_LOSS: current.MAX_DAILY_LOSS ?? "50000",
       MAX_OPEN_POSITIONS: current.MAX_OPEN_POSITIONS ?? "5",
       MAX_ORDERS_PER_DAY: current.MAX_ORDERS_PER_DAY ?? "10",

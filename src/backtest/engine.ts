@@ -38,6 +38,7 @@ export type BacktestConfig = {
   breakoutBufferPct: number;
   atrStopMultiple: number;
   riskPerTrade: number;
+  minCapitalDeployPct: number;
   minAdv20: number;
   minVolumeRatio: number;
   maxSignals: number;
@@ -119,6 +120,7 @@ export async function runBacktest(
     breakoutBufferPct: config.breakoutBufferPct,
     atrStopMultiple: config.atrStopMultiple,
     riskPerTrade: config.riskPerTrade,
+    minCapitalDeployPct: config.minCapitalDeployPct,
     minAdv20: config.minAdv20,
     minVolumeRatio: config.minVolumeRatio,
     maxSignals: config.maxSignals
@@ -448,6 +450,7 @@ function resolveConfig(cfg: Partial<BacktestConfig>): BacktestConfig {
     breakoutBufferPct: cfg.breakoutBufferPct ?? Number(process.env.STRATEGY_BREAKOUT_BUFFER_PCT ?? "0.02"),
     atrStopMultiple: cfg.atrStopMultiple ?? Number(process.env.ATR_STOP_MULTIPLE ?? "2"),
     riskPerTrade: cfg.riskPerTrade ?? Number(process.env.RISK_PER_TRADE ?? "0.015"),
+    minCapitalDeployPct: cfg.minCapitalDeployPct ?? Number(process.env.MIN_CAPITAL_DEPLOY_PCT ?? "0"),
     minAdv20: cfg.minAdv20 ?? Number(process.env.STRATEGY_MIN_ADV20 ?? "100000000"),
     minVolumeRatio: cfg.minVolumeRatio ?? Number(process.env.STRATEGY_MIN_VOLUME_RATIO ?? "1.2"),
     maxSignals: cfg.maxSignals ?? Number(process.env.STRATEGY_MAX_SIGNALS ?? "5")
