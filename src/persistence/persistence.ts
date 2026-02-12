@@ -120,6 +120,20 @@ export interface StrategyLabRecommendationRecord {
   createdAt: string;
 }
 
+export interface GttProtectionRecord {
+  id: number;
+  symbol: string;
+  qty: number;
+  entryPrice: number;
+  targetPrice: number;
+  stopPrice: number;
+  gttId: string;
+  status: "active" | "triggered" | "cancelled" | "failed";
+  createdAt: string;
+  updatedAt: string;
+  lastError?: string;
+}
+
 export interface Persistence {
   init(): Promise<void>;
   upsertOrder(order: Order): Promise<void>;
@@ -172,6 +186,17 @@ export interface Persistence {
   loadStrategyLabRecommendation(
     runId: string
   ): Promise<StrategyLabRecommendationRecord | null>;
+  upsertGttProtection(
+    protection: Omit<GttProtectionRecord, "id" | "createdAt" | "updatedAt">
+  ): Promise<void>;
+  loadGttProtections(status?: GttProtectionRecord["status"]): Promise<GttProtectionRecord[]>;
+  loadGttProtectionBySymbol(symbol: string): Promise<GttProtectionRecord | null>;
+  updateGttProtectionStatus(
+    symbol: string,
+    status: GttProtectionRecord["status"],
+    lastError?: string
+  ): Promise<void>;
+  deleteGttProtection(symbol: string): Promise<void>;
 }
 
 export class NoopPersistence implements Persistence {
@@ -252,4 +277,19 @@ export class NoopPersistence implements Persistence {
   ): Promise<StrategyLabRecommendationRecord | null> {
     return null;
   }
+  async upsertGttProtection(
+    _protection: Omit<GttProtectionRecord, "id" | "createdAt" | "updatedAt">
+  ): Promise<void> {}
+  async loadGttProtections(_status?: GttProtectionRecord["status"]): Promise<GttProtectionRecord[]> {
+    return [];
+  }
+  async loadGttProtectionBySymbol(_symbol: string): Promise<GttProtectionRecord | null> {
+    return null;
+  }
+  async updateGttProtectionStatus(
+    _symbol: string,
+    _status: GttProtectionRecord["status"],
+    _lastError?: string
+  ): Promise<void> {}
+  async deleteGttProtection(_symbol: string): Promise<void> {}
 }

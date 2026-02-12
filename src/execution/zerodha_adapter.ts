@@ -202,6 +202,143 @@ export class ZerodhaAdapter {
     }));
   }
 
+  async createOcoGtt(params: {
+    symbol: string;
+    qty: number;
+    lastPrice: number;
+    stopTrigger: number;
+    targetTrigger: number;
+  }): Promise<{ gttId: string }> {
+    if (!this.isLiveMode()) {
+      throw new Error("GTT create requires live mode");
+    }
+    const { apiKey, accessToken } = this.credentials();
+    const exchange = this.cfg.exchange ?? "NSE";
+    const product = this.cfg.product ?? "CNC";
+    const baseUrl = this.cfg.baseUrl ?? "https://api.kite.trade";
+    const condition = {
+      exchange,
+      tradingsymbol: params.symbol,
+      trigger_values: [params.stopTrigger, params.targetTrigger].sort((a, b) => a - b),
+      last_price: params.lastPrice
+    };
+    const orders = [
+      {
+        exchange,
+        tradingsymbol: params.symbol,
+        transaction_type: "SELL",
+        quantity: params.qty,
+        order_type: "LIMIT",
+        product,
+        price: params.stopTrigger
+      },
+      {
+        exchange,
+        tradingsymbol: params.symbol,
+        transaction_type: "SELL",
+        quantity: params.qty,
+        order_type: "LIMIT",
+        product,
+        price: params.targetTrigger
+      }
+    ];
+    const body = new URLSearchParams({
+      type: "two-leg",
+      condition: JSON.stringify(condition),
+      orders: JSON.stringify(orders)
+    });
+    const res = await fetch(`${baseUrl}/gtt/triggers`, {
+      method: "POST",
+      headers: {
+        "X-Kite-Version": "3",
+        Authorization: `token ${apiKey}:${accessToken}`
+      },
+      body
+    });
+    const raw = await res.text();
+    if (!res.ok) {
+      throw new Error(`GTT create failed ${res.status}: ${raw}`);
+    }
+    try {
+      const parsed = JSON.parse(raw) as { data?: { trigger_id?: number | string } };
+      const id = parsed.data?.trigger_id;
+      if (id === undefined || id === null) {
+        throw new Error("missing trigger_id");
+      }
+      return { gttId: String(id) };
+    } catch {
+      throw new Error(`GTT create parse failed: ${raw}`);
+    }
+  }
+
+  async listGttTriggers(): Promise<
+    Array<{
+      gttId: string;
+      symbol: string;
+      status: string;
+      updatedAt?: string;
+      triggerValues?: number[];
+    }>
+  > {
+    if (!this.isLiveMode()) {
+      return [];
+    }
+    const { apiKey, accessToken } = this.credentials();
+    const baseUrl = this.cfg.baseUrl ?? "https://api.kite.trade";
+    const res = await fetch(`${baseUrl}/gtt/triggers`, {
+      headers: {
+        "X-Kite-Version": "3",
+        Authorization: `token ${apiKey}:${accessToken}`
+      }
+    });
+    const raw = await res.text();
+    if (!res.ok) {
+      throw new Error(`GTT list failed ${res.status}: ${raw}`);
+    }
+    try {
+      const parsed = JSON.parse(raw) as {
+        data?: Array<{
+          id?: number | string;
+          condition?: { tradingsymbol?: string; trigger_values?: number[] };
+          status?: string;
+          updated_at?: string;
+        }>;
+      };
+      return (parsed.data ?? [])
+        .filter((x) => x.id !== undefined && x.id !== null)
+        .map((x) => ({
+          gttId: String(x.id),
+          symbol: String(x.condition?.tradingsymbol ?? ""),
+          status: String(x.status ?? "unknown"),
+          updatedAt: x.updated_at,
+          triggerValues: Array.isArray(x.condition?.trigger_values)
+            ? x.condition?.trigger_values
+            : undefined
+        }));
+    } catch {
+      throw new Error(`GTT list parse failed: ${raw}`);
+    }
+  }
+
+  async cancelGttTrigger(gttId: string): Promise<void> {
+    if (!this.isLiveMode()) {
+      return;
+    }
+    const { apiKey, accessToken } = this.credentials();
+    const baseUrl = this.cfg.baseUrl ?? "https://api.kite.trade";
+    const res = await fetch(`${baseUrl}/gtt/triggers/${encodeURIComponent(gttId)}`, {
+      method: "DELETE",
+      headers: {
+        "X-Kite-Version": "3",
+        Authorization: `token ${apiKey}:${accessToken}`
+      }
+    });
+    const raw = await res.text();
+    if (!res.ok) {
+      throw new Error(`GTT cancel failed ${res.status}: ${raw}`);
+    }
+  }
+
   async reconcileBrokerPositions(
     store: InMemoryStore,
     persistence: Persistence

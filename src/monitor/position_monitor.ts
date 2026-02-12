@@ -47,6 +47,9 @@ export class PositionMonitor {
   }
 
   async evaluateAndAct() {
+    if (this.exec.isLiveMode() && process.env.GTT_PROTECTION_ENABLED !== "0") {
+      return;
+    }
     for (const position of Array.from(this.managed.values())) {
       const current = this.store.positions.get(position.symbol);
       if (!current || current.qty <= 0) {

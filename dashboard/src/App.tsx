@@ -247,6 +247,23 @@ type PnlAttributionPayload = {
   bySetup: Array<{ key: string; pnl: number; tradeCount: number; winRate: number; avgPnl: number }>;
 };
 
+type GttPayload = {
+  enabled: boolean;
+  rows: Array<{
+    symbol: string;
+    qty: number;
+    entryPrice: number;
+    targetPrice: number;
+    stopPrice: number;
+    gttId: string;
+    status: string;
+    brokerStatus?: string | null;
+    brokerUpdatedAt?: string | null;
+    updatedAt: string;
+    lastError?: string;
+  }>;
+};
+
 const fallbackStatus: StatusPayload = {
   runningJob: null,
   liveMode: false,
@@ -326,6 +343,10 @@ const fallbackPnlAttribution: PnlAttributionPayload = {
   bySymbol: [],
   bySetup: []
 };
+const fallbackGtt: GttPayload = {
+  enabled: false,
+  rows: []
+};
 
 export default function App() {
   const [status, setStatus] = useState<StatusPayload>(fallbackStatus);
@@ -342,6 +363,7 @@ export default function App() {
   const [preopen, setPreopen] = useState<PreopenPayload>(fallbackPreopen);
   const [eodSummary, setEodSummary] = useState<EodSummaryPayload>(fallbackEodSummary);
   const [pnlAttrib, setPnlAttrib] = useState<PnlAttributionPayload>(fallbackPnlAttribution);
+  const [gtt, setGtt] = useState<GttPayload>(fallbackGtt);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [previewBusy, setPreviewBusy] = useState(false);
   const [morningPreview, setMorningPreview] = useState<MorningPreviewPayload>(fallbackMorningPreview);
@@ -387,7 +409,7 @@ export default function App() {
   }
 
   async function load() {
-    const [s, r, h, b, st, bt, sl, dr, jr, pa, ps, pr, po, eod] = await Promise.all([
+    const [s, r, h, b, st, bt, sl, dr, jr, pa, gttRows, ps, pr, po, eod] = await Promise.all([
       fetchJson<StatusPayload>("/api/status", fallbackStatus),
       fetchJson<ReportPayload>("/api/report", fallbackReport),
       fetchJson<HealthPayload>("/api/health", fallbackHealth),
@@ -398,6 +420,7 @@ export default function App() {
       fetchJson<DriftPayload>("/api/drift", fallbackDrift),
       fetchJson<JournalPayload>("/api/journal", fallbackJournal),
       fetchJson<PnlAttributionPayload>("/api/pnl-attribution", fallbackPnlAttribution),
+      fetchJson<GttPayload>("/api/gtt/status", fallbackGtt),
       fetchJson<ProfileStatusPayload>("/api/profile/status", fallbackProfileStatus),
       fetchJson<ProfileRecommendationPayload>("/api/profile/recommendation", fallbackProfileRec),
       fetchJson<PreopenPayload>("/api/preopen-check", fallbackPreopen),
@@ -413,6 +436,7 @@ export default function App() {
     setDrift(dr);
     setJournal(jr);
     setPnlAttrib(pa);
+    setGtt(gttRows);
     setProfileStatus(ps);
     setProfileRec(pr);
     setPreopen(po);
@@ -469,6 +493,21 @@ export default function App() {
       await load();
     } finally {
       setPreviewBusy(false);
+    }
+  }
+
+  async function cancelGtt(symbol: string) {
+    if (!window.confirm(`Cancel broker protection for ${symbol}?`)) return;
+    setBusy(true);
+    try {
+      await fetch("/api/gtt/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbol })
+      });
+      await load();
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -669,6 +708,7 @@ export default function App() {
         <button disabled={busy} onClick={() => void postAction("/api/run/backtest")} className="btn">Backtest</button>
         <button disabled={busy} onClick={() => void postAction("/api/strategy-lab/run")} className="btn">Strategy Lab</button>
         <button disabled={busy} onClick={() => void postAction("/api/funds/recompute")} className="btn">Recompute Funds</button>
+        <button disabled={busy} onClick={() => void postAction("/api/gtt/sync")} className="btn">Sync GTT</button>
         <button
           disabled={busy}
           onClick={async () => {
@@ -815,6 +855,36 @@ export default function App() {
               x.hintText ?? ""
             ])}
           />
+        </Card>
+
+        <Card title="Broker Protections (GTT)" span="wide" subtitle={gtt.enabled ? "Broker-native OCO protections" : "Disabled"}>
+          <div className="actions-inline" style={{ marginBottom: 8 }}>
+            <button className="btn" disabled={busy} onClick={() => void postAction("/api/gtt/sync")}>Sync GTT</button>
+          </div>
+          <SimpleTable
+            columns={["symbol", "qty", "entry", "target", "stop", "gttId", "status", "broker", "updated"]}
+            rows={(gtt.rows ?? []).slice(0, 40).map((x) => [
+              x.symbol,
+              String(x.qty),
+              num(x.entryPrice, 2),
+              num(x.targetPrice, 2),
+              num(x.stopPrice, 2),
+              x.gttId,
+              x.status,
+              x.brokerStatus ?? "",
+              new Date(x.updatedAt).toLocaleString("en-IN")
+            ])}
+          />
+          <div className="actions-inline" style={{ marginTop: 8 }}>
+            {(gtt.rows ?? [])
+              .filter((x) => x.status === "active")
+              .slice(0, 8)
+              .map((x) => (
+                <button key={x.symbol} className="btn" disabled={busy} onClick={() => void cancelGtt(x.symbol)}>
+                  Cancel {x.symbol}
+                </button>
+              ))}
+          </div>
         </Card>
 
         <Card title="Strategy Analytics" span="wide">

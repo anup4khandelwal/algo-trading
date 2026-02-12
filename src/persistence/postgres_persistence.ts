@@ -5,6 +5,7 @@ import {
   BacktestRunRecord,
   ClosedTradeLot,
   DailySnapshot,
+  GttProtectionRecord,
   ManagedPositionRecord,
   Persistence,
   StrategyLabCandidateRecord,
@@ -198,11 +199,28 @@ export class PostgresPersistence implements Persistence {
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
 
+      CREATE TABLE IF NOT EXISTS gtt_protections (
+        id BIGSERIAL PRIMARY KEY,
+        symbol TEXT NOT NULL UNIQUE,
+        qty INTEGER NOT NULL,
+        entry_price DOUBLE PRECISION NOT NULL,
+        target_price DOUBLE PRECISION NOT NULL,
+        stop_price DOUBLE PRECISION NOT NULL,
+        gtt_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        last_error TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
       CREATE INDEX IF NOT EXISTS idx_strategy_lab_runs_created_at
       ON strategy_lab_runs (created_at DESC);
 
       CREATE INDEX IF NOT EXISTS idx_strategy_lab_candidates_run
       ON strategy_lab_candidates (run_id, robustness_score DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_gtt_protections_status
+      ON gtt_protections (status, updated_at DESC);
     `);
   }
 
@@ -871,6 +889,123 @@ export class PostgresPersistence implements Persistence {
       reasonJson: row.reason_json ?? undefined,
       createdAt: new Date(row.created_at).toISOString()
     };
+  }
+
+  async upsertGttProtection(
+    protection: Omit<GttProtectionRecord, "id" | "createdAt" | "updatedAt">
+  ): Promise<void> {
+    await this.pool.query(
+      `
+      INSERT INTO gtt_protections (
+        symbol, qty, entry_price, target_price, stop_price, gtt_id, status, last_error, created_at, updated_at
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),NOW())
+      ON CONFLICT (symbol)
+      DO UPDATE SET
+        qty = EXCLUDED.qty,
+        entry_price = EXCLUDED.entry_price,
+        target_price = EXCLUDED.target_price,
+        stop_price = EXCLUDED.stop_price,
+        gtt_id = EXCLUDED.gtt_id,
+        status = EXCLUDED.status,
+        last_error = EXCLUDED.last_error,
+        updated_at = NOW()
+      `,
+      [
+        protection.symbol,
+        protection.qty,
+        protection.entryPrice,
+        protection.targetPrice,
+        protection.stopPrice,
+        protection.gttId,
+        protection.status,
+        protection.lastError ?? null
+      ]
+    );
+  }
+
+  async loadGttProtections(status?: GttProtectionRecord["status"]): Promise<GttProtectionRecord[]> {
+    const { rows } = status
+      ? await this.pool.query(
+          `
+          SELECT
+            id, symbol, qty, entry_price, target_price, stop_price, gtt_id, status, last_error, created_at, updated_at
+          FROM gtt_protections
+          WHERE status = $1
+          ORDER BY updated_at DESC
+          `,
+          [status]
+        )
+      : await this.pool.query(
+          `
+          SELECT
+            id, symbol, qty, entry_price, target_price, stop_price, gtt_id, status, last_error, created_at, updated_at
+          FROM gtt_protections
+          ORDER BY updated_at DESC
+          `
+        );
+    return rows.map((row) => ({
+      id: Number(row.id),
+      symbol: row.symbol,
+      qty: Number(row.qty),
+      entryPrice: Number(row.entry_price),
+      targetPrice: Number(row.target_price),
+      stopPrice: Number(row.stop_price),
+      gttId: row.gtt_id,
+      status: row.status,
+      createdAt: new Date(row.created_at).toISOString(),
+      updatedAt: new Date(row.updated_at).toISOString(),
+      lastError: row.last_error ?? undefined
+    }));
+  }
+
+  async loadGttProtectionBySymbol(symbol: string): Promise<GttProtectionRecord | null> {
+    const { rows } = await this.pool.query(
+      `
+      SELECT
+        id, symbol, qty, entry_price, target_price, stop_price, gtt_id, status, last_error, created_at, updated_at
+      FROM gtt_protections
+      WHERE symbol = $1
+      LIMIT 1
+      `,
+      [symbol]
+    );
+    if (rows.length === 0) {
+      return null;
+    }
+    const row = rows[0];
+    return {
+      id: Number(row.id),
+      symbol: row.symbol,
+      qty: Number(row.qty),
+      entryPrice: Number(row.entry_price),
+      targetPrice: Number(row.target_price),
+      stopPrice: Number(row.stop_price),
+      gttId: row.gtt_id,
+      status: row.status,
+      createdAt: new Date(row.created_at).toISOString(),
+      updatedAt: new Date(row.updated_at).toISOString(),
+      lastError: row.last_error ?? undefined
+    };
+  }
+
+  async updateGttProtectionStatus(
+    symbol: string,
+    status: GttProtectionRecord["status"],
+    lastError?: string
+  ): Promise<void> {
+    await this.pool.query(
+      `
+      UPDATE gtt_protections
+      SET status = $2, last_error = $3, updated_at = NOW()
+      WHERE symbol = $1
+      `,
+      [symbol, status, lastError ?? null]
+    );
+  }
+
+  async deleteGttProtection(symbol: string): Promise<void> {
+    await this.pool.query(`DELETE FROM gtt_protections WHERE symbol = $1`, [symbol]);
   }
 }
 

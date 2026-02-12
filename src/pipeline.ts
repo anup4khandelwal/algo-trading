@@ -10,7 +10,7 @@ import { MapLtpProvider } from "./market_data/ltp_provider.js";
 import { KiteLtpProvider } from "./market_data/kite_ltp_provider.js";
 import { KiteHistoricalProvider } from "./market_data/kite_historical_provider.js";
 import { PositionMonitor } from "./monitor/position_monitor.js";
-import { NoopPersistence } from "./persistence/persistence.js";
+import { GttProtectionRecord, NoopPersistence } from "./persistence/persistence.js";
 import { PostgresPersistence } from "./persistence/postgres_persistence.js";
 import { buildAlerter } from "./ops/alerter.js";
 import dotenv from "dotenv";
@@ -102,6 +102,13 @@ export async function runMonitorPass() {
     }
     await runtime.exec.reconcileBrokerPositions(runtime.store, runtime.persistence);
     await runtime.persistence.upsertSystemState("last_broker_sync_at", new Date().toISOString());
+    if (isGttProtectionEnabled()) {
+      try {
+        await syncGttProtections(runtime);
+      } catch (err) {
+        console.warn("GTT_SYNC_FAIL", err);
+      }
+    }
   }
   await runtime.positionMonitor.reconcileWithPositions();
   await runtime.positionMonitor.evaluateAndAct();
@@ -254,6 +261,9 @@ export async function runManualPositionExit(
   }
 
   await runtime.positionMonitor.reconcileWithPositions();
+  if ((after?.qty ?? 0) <= 0) {
+    await cancelGttProtectionIfAny(runtime, symbol);
+  }
   await persistDailySnapshot(runtime, "manual_exit");
   return {
     symbol,
@@ -367,7 +377,21 @@ async function placeSignals(
       });
 
       await portfolio.applyFill(fill);
-      await positionMonitor.trackEntry(fill, signal);
+      if (exec.isLiveMode() && isGttProtectionEnabled() && fill.side === "BUY") {
+        await ensureLiveProtectionOrUnwind(
+          {
+            store,
+            oms,
+            exec,
+            portfolio,
+            persistence
+          },
+          fill,
+          signal
+        );
+      } else {
+        await positionMonitor.trackEntry(fill, signal);
+      }
       if (fill.side === "BUY") {
         remainingFunds = Math.max(0, remainingFunds - fill.qty * fill.price);
       } else {
@@ -424,6 +448,94 @@ async function placeSignals(
       }
     }
   }
+}
+
+async function ensureLiveProtectionOrUnwind(
+  runtime: {
+    store: InMemoryStore;
+    oms: OMS;
+    exec: ZerodhaAdapter;
+    portfolio: PortfolioService;
+    persistence: Awaited<ReturnType<typeof buildPersistence>>;
+  },
+  fill: { symbol: string; qty: number; price: number; side: "BUY" | "SELL"; orderId: string; time: string },
+  signal: Signal
+) {
+  const symbol = fill.symbol;
+  const qty = fill.qty;
+  const entryPrice = fill.price;
+  const stopPrice = roundPx(signal.stopPrice);
+  const targetPrice = roundPx(signal.targetPrice ?? signal.entryPrice + (signal.entryPrice - signal.stopPrice) * 2);
+  const ltp = await runtime.exec.getLtp(symbol);
+  try {
+    const gtt = await runtime.exec.createOcoGtt({
+      symbol,
+      qty,
+      lastPrice: ltp,
+      stopTrigger: stopPrice,
+      targetTrigger: targetPrice
+    });
+    await runtime.persistence.upsertGttProtection({
+      symbol,
+      qty,
+      entryPrice,
+      stopPrice,
+      targetPrice,
+      gttId: gtt.gttId,
+      status: "active"
+    });
+    return;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await runtime.persistence.upsertGttProtection({
+      symbol,
+      qty,
+      entryPrice,
+      stopPrice,
+      targetPrice,
+      gttId: "n/a",
+      status: "failed",
+      lastError: message.slice(0, 500)
+    });
+    await unwindPositionImmediately(runtime, symbol, qty, `GTT protect failed: ${message}`);
+    throw new Error(`Protection creation failed for ${symbol}; entry unwound. ${message}`);
+  }
+}
+
+async function unwindPositionImmediately(
+  runtime: {
+    oms: OMS;
+    exec: ZerodhaAdapter;
+    portfolio: PortfolioService;
+    persistence: Awaited<ReturnType<typeof buildPersistence>>;
+  },
+  symbol: string,
+  qty: number,
+  reason: string
+) {
+  const intent: OrderIntent = {
+    idempotencyKey: `UNWIND-${symbol}-${Date.now()}`,
+    symbol,
+    side: "SELL",
+    qty,
+    type: "MARKET",
+    timeInForce: "DAY",
+    createdAt: new Date().toISOString(),
+    signalReason: reason
+  };
+  const order = await runtime.oms.createOrder(intent);
+  await runtime.oms.updateState(order.orderId, "OPEN");
+  const fill = await runtime.exec.placeOrder(order);
+  await runtime.oms.updateState(order.orderId, "FILLED", {
+    filledQty: fill.qty,
+    avgFillPrice: fill.price
+  });
+  await runtime.portfolio.applyFill(fill);
+  await runtime.persistence.closeTradeEntryLots(fill.symbol, fill.qty, fill.price, fill.time);
+}
+
+function roundPx(v: number) {
+  return Math.max(0.01, Math.round(v * 100) / 100);
 }
 
 async function evaluateSignalsForPreview(
@@ -803,8 +915,126 @@ async function closeAllPositions(runtime: Awaited<ReturnType<typeof createRuntim
     await portfolio.applyFill(fill);
     await persistence.closeTradeEntryLots(fill.symbol, fill.qty, fill.price, fill.time);
     await persistence.deleteManagedPosition(fill.symbol);
+    await cancelGttProtectionIfAny(runtime, fill.symbol);
     console.log("EOD_CLOSE", fill.symbol, fill.qty, fill.price.toFixed(2));
   }
+}
+
+export async function getGttProtectionStatus() {
+  dotenv.config();
+  const persistence = await buildPersistence();
+  const exec = buildOpsExecutionAdapter();
+  const [records, brokerTriggers] = await Promise.all([
+    persistence.loadGttProtections(),
+    exec.isLiveMode() ? exec.listGttTriggers() : Promise.resolve([])
+  ]);
+  const triggerById = new Map(brokerTriggers.map((x) => [x.gttId, x]));
+  return records.map((r) => ({
+    ...r,
+    brokerStatus: triggerById.get(r.gttId)?.status ?? null,
+    brokerUpdatedAt: triggerById.get(r.gttId)?.updatedAt ?? null
+  }));
+}
+
+export async function runGttSyncPass() {
+  dotenv.config();
+  const persistence = await buildPersistence();
+  const exec = buildOpsExecutionAdapter();
+  if (!exec.isLiveMode()) {
+    return { synced: 0, changed: 0, message: "paper mode" };
+  }
+  const changed = await syncGttProtectionsWith(persistence, exec);
+  return { synced: changed.synced, changed: changed.changed, message: "ok" };
+}
+
+export async function cancelGttProtectionForSymbol(symbolRaw: string) {
+  dotenv.config();
+  const symbol = symbolRaw.trim().toUpperCase();
+  const persistence = await buildPersistence();
+  const exec = buildOpsExecutionAdapter();
+  const existing = await persistence.loadGttProtectionBySymbol(symbol);
+  if (!existing) {
+    return { ok: false, error: `No GTT protection for ${symbol}` };
+  }
+  if (exec.isLiveMode() && existing.gttId !== "n/a") {
+    await exec.cancelGttTrigger(existing.gttId);
+  }
+  await persistence.updateGttProtectionStatus(symbol, "cancelled");
+  return { ok: true, symbol };
+}
+
+async function cancelGttProtectionIfAny(
+  runtime: Awaited<ReturnType<typeof createRuntime>>,
+  symbol: string
+) {
+  if (!isGttProtectionEnabled()) {
+    return;
+  }
+  const record = await runtime.persistence.loadGttProtectionBySymbol(symbol);
+  if (!record || record.status !== "active") {
+    return;
+  }
+  try {
+    if (runtime.exec.isLiveMode() && record.gttId !== "n/a") {
+      await runtime.exec.cancelGttTrigger(record.gttId);
+    }
+    await runtime.persistence.updateGttProtectionStatus(symbol, "cancelled");
+  } catch (err) {
+    await runtime.persistence.updateGttProtectionStatus(
+      symbol,
+      "failed",
+      (err instanceof Error ? err.message : String(err)).slice(0, 500)
+    );
+  }
+}
+
+async function syncGttProtections(runtime: Awaited<ReturnType<typeof createRuntime>>) {
+  return syncGttProtectionsWith(runtime.persistence, runtime.exec);
+}
+
+async function syncGttProtectionsWith(
+  persistence: Awaited<ReturnType<typeof buildPersistence>>,
+  exec: ZerodhaAdapter
+) {
+  const rows = await persistence.loadGttProtections("active");
+  const brokerRows = await exec.listGttTriggers();
+  const byGttId = new Map(brokerRows.map((x) => [x.gttId, x]));
+  let changed = 0;
+  for (const row of rows) {
+    const broker = byGttId.get(row.gttId);
+    if (!broker) {
+      continue;
+    }
+    const normalized = normalizeGttStatus(broker.status);
+    if (normalized !== row.status) {
+      await persistence.updateGttProtectionStatus(row.symbol, normalized);
+      changed += 1;
+    }
+  }
+  return { synced: rows.length, changed };
+}
+
+function normalizeGttStatus(raw: string): GttProtectionRecord["status"] {
+  const s = raw.toLowerCase();
+  if (s.includes("active") || s.includes("enabled")) return "active";
+  if (s.includes("trigger")) return "triggered";
+  if (s.includes("cancel") || s.includes("disabled")) return "cancelled";
+  return "failed";
+}
+
+function isGttProtectionEnabled() {
+  return process.env.GTT_PROTECTION_ENABLED !== "0";
+}
+
+function buildOpsExecutionAdapter() {
+  return new ZerodhaAdapter(new MapLtpProvider(new Map([["NIFTYBEES", 1]])), {
+    mode: buildExecutionMode(),
+    apiKey: process.env.KITE_API_KEY,
+    accessToken: process.env.KITE_ACCESS_TOKEN,
+    product: process.env.KITE_PRODUCT ?? "CNC",
+    exchange: process.env.KITE_EXCHANGE ?? "NSE",
+    orderVariety: (process.env.KITE_ORDER_VARIETY as "regular" | "amo" | undefined) ?? "regular"
+  });
 }
 
 async function persistDailySnapshot(

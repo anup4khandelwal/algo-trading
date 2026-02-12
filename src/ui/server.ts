@@ -5,6 +5,9 @@ import { readFile } from "node:fs/promises";
 import dotenv from "dotenv";
 import { Pool } from "pg";
 import {
+  cancelGttProtectionForSymbol,
+  getGttProtectionStatus,
+  runGttSyncPass,
   runEodClosePass,
   runManualPositionExit,
   runManualStopUpdate,
@@ -250,6 +253,12 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (method === "GET" && url.pathname === "/api/gtt/status") {
+      const rows = await getGttProtectionStatus();
+      json(res, 200, { enabled: process.env.GTT_PROTECTION_ENABLED !== "0", rows });
+      return;
+    }
+
     if (method === "GET" && url.pathname === "/api/reports/weekly.pdf") {
       const pdf = await buildWeeklyPdfReport();
       res.writeHead(200, {
@@ -321,6 +330,28 @@ const server = http.createServer(async (req, res) => {
     if (method === "POST" && url.pathname === "/api/funds/recompute") {
       const snapshot = await recomputeFundsSnapshot();
       json(res, 200, { ok: true, funds: snapshot });
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/api/gtt/sync") {
+      const out = await runGttSyncPass();
+      json(res, 200, { ok: true, ...out });
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/api/gtt/cancel") {
+      const body = await readJsonBody(req);
+      const symbol = String(body?.symbol ?? "").trim().toUpperCase();
+      if (!symbol) {
+        json(res, 400, { error: "symbol is required" });
+        return;
+      }
+      const out = await cancelGttProtectionForSymbol(symbol);
+      if (!out.ok) {
+        json(res, 400, out);
+        return;
+      }
+      json(res, 200, out);
       return;
     }
 

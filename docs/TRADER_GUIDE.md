@@ -143,6 +143,15 @@ Manual controls:
 
 Use only as exception handling, not routine strategy override.
 
+## Broker Protections (GTT)
+- Live mode now attaches broker-native OCO protection after each BUY fill:
+  - stop-loss trigger
+  - target trigger
+- If protection cannot be created, app exits that position immediately.
+- Use dashboard card **Broker Protections (GTT)** to:
+  - sync broker/local statuses
+  - cancel an active protection for a symbol (manual override)
+
 ## Broker Orderbook
 Detailed broker order feed with diagnostics.
 Filters:

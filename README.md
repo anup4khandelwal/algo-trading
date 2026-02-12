@@ -156,6 +156,7 @@ Use these env controls before enabling live orders:
   - `TELEGRAM_BOT_TOKEN`
   - `TELEGRAM_CHAT_ID`
 - `LIVE_CHECK_MARKET_POLICY=warn|strict` (`strict` fails checklist outside 09:15-15:30 IST)
+- `GTT_PROTECTION_ENABLED=1` enables broker-native OCO protection (target + stop) after entry.
 
 ## Backtest
 Set optional env (or keep defaults):
@@ -202,6 +203,15 @@ npm run journal:export
   - eligibility/skip reason per symbol,
   - preflight status and usable funds snapshot.
 - In dashboard, click **Morning** -> review preview -> **Confirm Morning Run**.
+
+## Broker-Native GTT Protection
+- For live entries, app now creates a Zerodha GTT OCO (`two-leg`) immediately after BUY fill.
+- If GTT creation fails, entry is unwound immediately (safety-first block-entry behavior).
+- New APIs:
+  - `GET /api/gtt/status`
+  - `POST /api/gtt/sync`
+  - `POST /api/gtt/cancel` with `{ symbol }`
+- Dashboard card: **Broker Protections (GTT)** with sync + cancel controls.
 
 ## PnL Attribution
 - New endpoint: `GET /api/pnl-attribution`
