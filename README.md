@@ -179,6 +179,17 @@ Use these env controls before enabling live orders:
     - `POST /api/billing/webhook/stripe`
     - `POST /api/billing/webhook/razorpay`
     - `GET /api/billing/events` (latest stored webhook events)
+  - Webhook processing is idempotent (provider+event keys are deduplicated per tenant).
+  - Tenant/auth controls:
+    - `DEFAULT_TENANT_ID=default`
+    - send `x-tenant-id` per request for workspace isolation
+    - optional `ADMIN_API_TOKEN` required for sensitive `POST /api/*` calls
+  - Premium gating + trial:
+    - `BILLING_ENFORCE_PREMIUM=1` locks backtest/strategy-lab to active or trialing tenants
+    - `POST /api/onboarding/start-trial` starts trial
+    - `GET /api/onboarding/status` returns onboarding and subscription state
+    - `GET /api/billing/subscription` subscription state
+    - `GET /api/audit/events` tenant-scoped audit feed
 
 ## Backtest
 Set optional env (or keep defaults):

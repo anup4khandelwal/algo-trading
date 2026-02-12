@@ -286,6 +286,34 @@ type BillingEventsPayload = {
     amountInr?: number;
   }>;
 };
+type SubscriptionPayload = {
+  tenantId: string;
+  subscription: {
+    status: string;
+    planId: string;
+    premiumEnabled: boolean;
+    trialEndsAt?: string;
+    updatedAt?: string;
+    source?: string;
+  };
+};
+type OnboardingPayload = {
+  tenantId: string;
+  started: boolean;
+  checklistOk: boolean;
+  nextStep: string;
+  subscription: {
+    status: string;
+    planId: string;
+    premiumEnabled: boolean;
+    trialEndsAt?: string;
+  };
+};
+type AuditEventsPayload = {
+  enabled: boolean;
+  tenantId: string;
+  events: Array<{ at?: string; action?: string; detail?: unknown }>;
+};
 
 const fallbackStatus: StatusPayload = {
   runningJob: null,
@@ -343,6 +371,18 @@ const fallbackPnlAttribution: PnlAttributionPayload = { enabled: false, rows: []
 const fallbackGtt: GttPayload = { enabled: false, rows: [] };
 const fallbackBilling: BillingConfigPayload = { provider: "none", enabled: false, plans: [] };
 const fallbackBillingEvents: BillingEventsPayload = { enabled: false, events: [] };
+const fallbackSubscription: SubscriptionPayload = {
+  tenantId: "default",
+  subscription: { status: "none", planId: "", premiumEnabled: false }
+};
+const fallbackOnboarding: OnboardingPayload = {
+  tenantId: "default",
+  started: false,
+  checklistOk: false,
+  nextStep: "start_trial",
+  subscription: { status: "none", planId: "", premiumEnabled: false }
+};
+const fallbackAudit: AuditEventsPayload = { enabled: false, tenantId: "default", events: [] };
 
 export default function App() {
   const [page, setPage] = useState<PageKey>("overview");
@@ -364,6 +404,9 @@ export default function App() {
   const [gtt, setGtt] = useState<GttPayload>(fallbackGtt);
   const [billing, setBilling] = useState<BillingConfigPayload>(fallbackBilling);
   const [billingEvents, setBillingEvents] = useState<BillingEventsPayload>(fallbackBillingEvents);
+  const [subscription, setSubscription] = useState<SubscriptionPayload>(fallbackSubscription);
+  const [onboarding, setOnboarding] = useState<OnboardingPayload>(fallbackOnboarding);
+  const [auditEvents, setAuditEvents] = useState<AuditEventsPayload>(fallbackAudit);
 
   const [previewOpen, setPreviewOpen] = useState(false);
   const [previewBusy, setPreviewBusy] = useState(false);
@@ -397,12 +440,22 @@ export default function App() {
   const [billingProviderFilter, setBillingProviderFilter] = useState("all");
   const [billingStatusFilter, setBillingStatusFilter] = useState("all");
   const [billingSearch, setBillingSearch] = useState("");
+  const [tenantId, setTenantId] = useState("default");
+  const [adminToken, setAdminToken] = useState("");
 
   const safeModeOn = status.safeMode?.enabled === true;
 
+  function apiHeaders(contentType = false): HeadersInit {
+    const out: Record<string, string> = {};
+    if (tenantId.trim()) out["x-tenant-id"] = tenantId.trim();
+    if (adminToken.trim()) out["x-admin-token"] = adminToken.trim();
+    if (contentType) out["Content-Type"] = "application/json";
+    return out;
+  }
+
   async function fetchJson<T>(url: string, fallback: T): Promise<T> {
     try {
-      const res = await fetch(url);
+      const res = await fetch(url, { headers: apiHeaders(false) });
       if (!res.ok) return fallback;
       return (await res.json()) as T;
     } catch {
@@ -419,7 +472,7 @@ export default function App() {
   }
 
   async function load() {
-    const [s, r, h, b, st, bt, sl, dr, jr, pa, gttRows, ps, pr, env, po, eod, bill, billEvents] = await Promise.all([
+    const [s, r, h, b, st, bt, sl, dr, jr, pa, gttRows, ps, pr, env, po, eod, bill, billEvents, sub, onboard, audit] = await Promise.all([
       fetchJson<StatusPayload>("/api/status", fallbackStatus),
       fetchJson<ReportPayload>("/api/report", fallbackReport),
       fetchJson<HealthPayload>("/api/health", fallbackHealth),
@@ -437,7 +490,10 @@ export default function App() {
       fetchJson<PreopenPayload>("/api/preopen-check", fallbackPreopen),
       fetchJson<EodSummaryPayload>("/api/eod-summary", fallbackEodSummary),
       fetchJson<BillingConfigPayload>("/api/billing/config", fallbackBilling),
-      fetchJson<BillingEventsPayload>("/api/billing/events", fallbackBillingEvents)
+      fetchJson<BillingEventsPayload>("/api/billing/events", fallbackBillingEvents),
+      fetchJson<SubscriptionPayload>("/api/billing/subscription", fallbackSubscription),
+      fetchJson<OnboardingPayload>("/api/onboarding/status", fallbackOnboarding),
+      fetchJson<AuditEventsPayload>("/api/audit/events", fallbackAudit)
     ]);
 
     setStatus(s);
@@ -458,6 +514,9 @@ export default function App() {
     setEodSummary(eod);
     setBilling(bill);
     setBillingEvents(billEvents);
+    setSubscription(sub);
+    setOnboarding(onboard);
+    setAuditEvents(audit);
     setLastRefresh(new Date().toLocaleString("en-IN"));
     if (!exitSymbol && (r.positions?.length ?? 0) > 0) {
       setExitSymbol(r.positions?.[0]?.symbol ?? "");
@@ -482,14 +541,14 @@ export default function App() {
 
   useEffect(() => {
     void load();
-  }, [statusFilter, severityFilter, searchFilter]);
+  }, [statusFilter, severityFilter, searchFilter, tenantId]);
 
   async function postAction(path: string, body?: unknown) {
     setBusy(true);
     try {
       await fetch(path, {
         method: "POST",
-        headers: body ? { "Content-Type": "application/json" } : undefined,
+        headers: body ? apiHeaders(true) : apiHeaders(false),
         body: body ? JSON.stringify(body) : undefined
       });
       await load();
@@ -512,7 +571,7 @@ export default function App() {
   async function confirmMorningRun() {
     setPreviewBusy(true);
     try {
-      await fetch("/api/run/morning", { method: "POST" });
+      await fetch("/api/run/morning", { method: "POST", headers: apiHeaders(false) });
       setPreviewOpen(false);
       await load();
     } finally {
@@ -526,7 +585,7 @@ export default function App() {
     try {
       const res = await fetch("/api/billing/checkout", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: apiHeaders(true),
         body: JSON.stringify({ planId })
       });
       const body = (await res.json()) as { ok?: boolean; error?: string; url?: string; message?: string };
@@ -541,13 +600,34 @@ export default function App() {
     }
   }
 
+  async function startTrial() {
+    setBillingMsg("");
+    setBusy(true);
+    try {
+      const res = await fetch("/api/onboarding/start-trial", {
+        method: "POST",
+        headers: apiHeaders(true),
+        body: JSON.stringify({})
+      });
+      const body = (await res.json()) as { ok?: boolean; error?: string; trialEndsAt?: string };
+      if (!res.ok || body.ok !== true) {
+        setBillingMsg(body.error ?? "Unable to start trial");
+        return;
+      }
+      setBillingMsg(`Trial started. Ends at ${body.trialEndsAt ? new Date(body.trialEndsAt).toLocaleString("en-IN") : "n/a"}`);
+      await load();
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function cancelGtt(symbol: string) {
     if (!window.confirm(`Cancel broker protection for ${symbol}?`)) return;
     setBusy(true);
     try {
       await fetch("/api/gtt/cancel", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: apiHeaders(true),
         body: JSON.stringify({ symbol })
       });
       await load();
@@ -565,7 +645,7 @@ export default function App() {
     try {
       const res = await fetch("/api/position/exit", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: apiHeaders(true),
         body: JSON.stringify({
           symbol: exitSymbol,
           percent: full ? 100 : Math.max(1, Math.min(100, Number(exitPercent || 1))),
@@ -593,7 +673,7 @@ export default function App() {
     try {
       const res = await fetch("/api/position/stop", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: apiHeaders(true),
         body: JSON.stringify({ symbol: exitSymbol, stopPrice: Number(stopPrice) })
       });
       const body = (await res.json()) as { error?: string };
@@ -619,7 +699,7 @@ export default function App() {
     try {
       const res = await fetch("/api/journal", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: apiHeaders(true),
         body: JSON.stringify({
           lotId,
           symbol: symbolRaw,
@@ -649,7 +729,7 @@ export default function App() {
     try {
       await fetch("/api/profile/switch", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: apiHeaders(true),
         body: JSON.stringify({ profile, reason: "UI profile switch" })
       });
       await load();
@@ -665,7 +745,7 @@ export default function App() {
     try {
       const res = await fetch("/api/strategy-lab/apply", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: apiHeaders(true),
         body: JSON.stringify({ candidateId })
       });
       const body = (await res.json()) as { error?: string; ok?: boolean };
@@ -708,7 +788,7 @@ export default function App() {
     try {
       const res = await fetch("/api/env/config", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: apiHeaders(true),
         body: JSON.stringify({ updates })
       });
       const body = (await res.json()) as { error?: string; ok?: boolean; restartRequired?: boolean };
@@ -1072,7 +1152,21 @@ export default function App() {
           <section className="grid">
             <Card title="Monetization Setup" span="wide" subtitle={`Provider: ${billing.provider.toUpperCase()} | ${billing.enabled ? "Enabled" : "Disabled"}`}>
               <div className="meta">Configure `PAYMENT_PROVIDER`, `PAYMENT_CHECKOUT_BASE_URL`, and optional `PAYMENT_SUCCESS_URL`/`PAYMENT_CANCEL_URL` in `.env`.</div>
+              <div className="form-grid two-col" style={{ marginBottom: 8 }}>
+                <input value={tenantId} onChange={(e) => setTenantId(e.target.value)} placeholder="Tenant ID (x-tenant-id)" />
+                <input value={adminToken} onChange={(e) => setAdminToken(e.target.value)} placeholder="Admin API Token (optional)" type="password" />
+              </div>
+              <div className="meta">
+                Tenant: {subscription.tenantId} | Subscription: {(subscription.subscription.status || "none").toUpperCase()} | Plan: {subscription.subscription.planId || "n/a"} | Premium: {subscription.subscription.premiumEnabled ? "YES" : "NO"}
+              </div>
+              <div className="meta">
+                Onboarding: {onboarding.started ? "STARTED" : "NOT STARTED"} | Checklist: {onboarding.checklistOk ? "PASS" : "BLOCKED"} | Next: {onboarding.nextStep}
+              </div>
               <div className="meta">{billingMsg || "Choose a plan to test the checkout flow."}</div>
+              <div className="actions">
+                <button className="btn" disabled={busy} onClick={() => void startTrial()}>Start Trial</button>
+                <button className="btn" disabled={busy} onClick={() => void load()}>Reload Billing State</button>
+              </div>
             </Card>
             {(billing.plans ?? []).map((plan) => (
               <Card key={plan.id} title={plan.name} subtitle={plan.recommended ? "Most Popular" : ""}>
@@ -1113,6 +1207,16 @@ export default function App() {
                   Number.isFinite(Number(x.amountInr)) ? inr(Number(x.amountInr ?? 0)) : "",
                   x.reason ?? "",
                   x.eventId ?? ""
+                ])}
+              />
+            </Card>
+            <Card title="Audit Trail" span="wide" subtitle={`Events: ${(auditEvents.events ?? []).length}`}>
+              <SimpleTable
+                columns={["time", "action", "detail"]}
+                rows={(auditEvents.events ?? []).slice(0, 80).map((x) => [
+                  x.at ? new Date(x.at).toLocaleString("en-IN") : "",
+                  x.action ?? "",
+                  typeof x.detail === "string" ? x.detail : JSON.stringify(x.detail ?? {})
                 ])}
               />
             </Card>

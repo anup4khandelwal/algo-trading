@@ -101,6 +101,19 @@ type BillingConfigPayload = {
     recommended?: boolean;
   }>;
 };
+type SubscriptionState = {
+  tenantId: string;
+  status: "none" | "trialing" | "active" | "past_due" | "canceled" | "unpaid";
+  planId: string;
+  customerId?: string;
+  subscriptionId?: string;
+  source: "manual" | "checkout" | "webhook";
+  currentPeriodEnd?: string;
+  trialEndsAt?: string;
+  updatedAt: string;
+  lastEventType?: string;
+  premiumEnabled: boolean;
+};
 let runningJob: UiJob | null = null;
 let lastDbErrorLogAt = 0;
 let lastTokenRiskAlertAt = 0;
@@ -146,6 +159,14 @@ const server = http.createServer(async (req, res) => {
   try {
     const method = req.method ?? "GET";
     const url = new URL(req.url ?? "/", `http://127.0.0.1:${PORT}`);
+    const tenantId = getTenantId(req, url);
+
+    if (method === "POST" && url.pathname.startsWith("/api/") && !isWebhookPath(url.pathname)) {
+      if (!isAdminAuthorized(req)) {
+        json(res, 401, { error: "Unauthorized. Set x-admin-token or disable ADMIN_API_TOKEN." });
+        return;
+      }
+    }
 
     if (method === "GET" && !url.pathname.startsWith("/api")) {
       const served = await tryServeReactApp(url.pathname, res);
@@ -256,6 +277,10 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (method === "GET" && url.pathname === "/api/strategy-lab/latest") {
+      if (!(await hasPremiumAccess(tenantId))) {
+        json(res, 403, { error: "Premium feature locked. Activate trial/subscription." });
+        return;
+      }
       const data = await getStrategyLabReport();
       json(res, 200, data);
       return;
@@ -317,6 +342,10 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (method === "POST" && url.pathname === "/api/run/backtest") {
+      if (!(await hasPremiumAccess(tenantId))) {
+        json(res, 403, { error: "Premium feature locked. Activate trial/subscription." });
+        return;
+      }
       if (!launchJob(res, "backtest", "BACKTEST_JOB", () => runConfiguredBacktest())) {
         return;
       }
@@ -324,6 +353,10 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (method === "POST" && url.pathname === "/api/strategy-lab/run") {
+      if (!(await hasPremiumAccess(tenantId))) {
+        json(res, 403, { error: "Premium feature locked. Activate trial/subscription." });
+        return;
+      }
       if (!launchJob(res, "strategy_lab", "STRATLAB_JOB", () => runStrategyLabAndPersist())) {
         return;
       }
@@ -331,6 +364,10 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (method === "POST" && url.pathname === "/api/strategy-lab/apply") {
+      if (!(await hasPremiumAccess(tenantId))) {
+        json(res, 403, { error: "Premium feature locked. Activate trial/subscription." });
+        return;
+      }
       const body = await readJsonBody(req);
       const candidateId = String(body?.candidateId ?? "").trim();
       if (!candidateId) {
@@ -463,13 +500,18 @@ const server = http.createServer(async (req, res) => {
       }
       const applied = await applyEnvOverrides(updates);
       const restartRequired = Object.keys(updates).some((key) => ENV_RESTART_REQUIRED_KEYS.has(key));
+      await appendAuditEvent(tenantId, "env_config_updated", {
+        keys: Object.keys(updates),
+        restartRequired
+      });
       json(res, 200, { ok: true, applied, restartRequired });
       return;
     }
 
     if (method === "GET" && url.pathname === "/api/billing/config") {
       const cfg = getBillingConfig();
-      json(res, 200, cfg);
+      const subscription = await getSubscriptionState(tenantId);
+      json(res, 200, { ...cfg, subscription, tenantId });
       return;
     }
 
@@ -495,7 +537,19 @@ const server = http.createServer(async (req, res) => {
         json(res, 400, { ok: false, error: "Checkout URL/session is not configured" });
         return;
       }
-      json(res, 200, { ok: true, url, provider: cfg.provider, planId: plan.id });
+      await upsertSubscriptionState(tenantId, {
+        status: "past_due",
+        planId: plan.id,
+        source: "checkout",
+        updatedAt: new Date().toISOString(),
+        lastEventType: "checkout_initiated",
+        premiumEnabled: false
+      });
+      await appendAuditEvent(tenantId, "billing_checkout_started", {
+        provider: cfg.provider,
+        planId: plan.id
+      });
+      json(res, 200, { ok: true, url, provider: cfg.provider, planId: plan.id, tenantId });
       return;
     }
 
@@ -517,13 +571,14 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const eventObj = event as Record<string, unknown>;
-      await persistBillingWebhookEvent(
+      const result = await persistBillingWebhookEvent(
         "stripe",
         String(eventObj.id ?? ""),
         String(eventObj.type ?? "unknown"),
+        tenantId,
         eventObj
       );
-      json(res, 200, { ok: true, received: true });
+      json(res, 200, { ok: true, received: true, deduped: result.deduped, tenantId });
       return;
     }
 
@@ -549,19 +604,65 @@ const server = http.createServer(async (req, res) => {
         (eventObj.payload as Record<string, unknown> | undefined)?.subscription) as
         | Record<string, unknown>
         | undefined;
-      await persistBillingWebhookEvent(
+      const result = await persistBillingWebhookEvent(
         "razorpay",
         String(payloadEntity?.id ?? eventObj.event ?? ""),
         String(eventObj.event ?? "unknown"),
+        tenantId,
         eventObj
       );
-      json(res, 200, { ok: true, received: true });
+      json(res, 200, { ok: true, received: true, deduped: result.deduped, tenantId });
       return;
     }
 
     if (method === "GET" && url.pathname === "/api/billing/events") {
-      const events = await getBillingWebhookEvents();
+      const events = await getBillingWebhookEvents(tenantId);
       json(res, 200, events);
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/api/billing/subscription") {
+      const subscription = await getSubscriptionState(tenantId);
+      json(res, 200, { tenantId, subscription });
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/api/onboarding/start-trial") {
+      const body = await readJsonBody(req);
+      const days = Math.max(1, Math.min(30, Number(body?.days ?? process.env.BILLING_TRIAL_DAYS ?? "14")));
+      const now = new Date();
+      const trialEndsAt = new Date(now.getTime() + days * 24 * 3600 * 1000).toISOString();
+      await upsertSubscriptionState(tenantId, {
+        status: "trialing",
+        planId: "trial",
+        source: "manual",
+        trialEndsAt,
+        updatedAt: now.toISOString(),
+        lastEventType: "trial_started",
+        premiumEnabled: true
+      });
+      await appendAuditEvent(tenantId, "trial_started", { days, trialEndsAt });
+      json(res, 200, { ok: true, tenantId, trialEndsAt });
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/api/onboarding/status") {
+      const subscription = await getSubscriptionState(tenantId);
+      const checks = await getPreopenChecklist();
+      const started = subscription.status !== "none";
+      json(res, 200, {
+        tenantId,
+        started,
+        subscription,
+        checklistOk: checks.ok,
+        nextStep: started ? "connect_broker_and_run_preflight" : "start_trial"
+      });
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/api/audit/events") {
+      const audit = await getAuditEvents(tenantId);
+      json(res, 200, audit);
       return;
     }
 
@@ -582,6 +683,7 @@ const server = http.createServer(async (req, res) => {
       const applied = await applyProfile(profile);
       scheduler.stop();
       await setSafeMode(true, `Profile switched to ${profile}: ${reason}`, "profile_switch");
+      await appendAuditEvent(tenantId, "profile_switched", { profile, reason });
       await notifyOpsAlert("warning", "profile_switched", `Profile switched to ${profile}`, {
         reason,
         profile,
@@ -717,6 +819,35 @@ function contentTypeForPath(filePath: string) {
   return "application/octet-stream";
 }
 
+function isWebhookPath(pathname: string) {
+  return pathname === "/api/billing/webhook/stripe" || pathname === "/api/billing/webhook/razorpay";
+}
+
+function isAdminAuthorized(req: http.IncomingMessage) {
+  const configured = process.env.ADMIN_API_TOKEN;
+  if (!configured || configured.trim().length === 0) {
+    return true;
+  }
+  const provided = String(req.headers["x-admin-token"] ?? "");
+  return provided === configured;
+}
+
+function getTenantId(req: http.IncomingMessage, url: URL) {
+  const fromHeader = String(req.headers["x-tenant-id"] ?? "").trim();
+  const fromQuery = String(url.searchParams.get("tenant") ?? "").trim();
+  const tenant = fromHeader || fromQuery || process.env.DEFAULT_TENANT_ID || "default";
+  return sanitizeTenantId(tenant);
+}
+
+function sanitizeTenantId(raw: string) {
+  const normalized = raw.toLowerCase().replace(/[^a-z0-9_-]/g, "-");
+  return normalized.slice(0, 48) || "default";
+}
+
+function tenantKey(tenantId: string, key: string) {
+  return `tenant:${tenantId}:${key}`;
+}
+
 const ENV_SENSITIVE_KEYS = new Set([
   "DATABASE_URL",
   "KITE_API_SECRET",
@@ -769,7 +900,11 @@ const ENV_DESCRIPTIONS: Record<string, string> = {
   STRIPE_WEBHOOK_SECRET: "Stripe webhook signing secret for event verification.",
   RAZORPAY_KEY_ID: "Razorpay key id.",
   RAZORPAY_KEY_SECRET: "Razorpay key secret.",
-  RAZORPAY_WEBHOOK_SECRET: "Razorpay webhook signing secret for event verification."
+  RAZORPAY_WEBHOOK_SECRET: "Razorpay webhook signing secret for event verification.",
+  ADMIN_API_TOKEN: "Optional admin token required for sensitive POST APIs.",
+  DEFAULT_TENANT_ID: "Default tenant id for requests without x-tenant-id.",
+  BILLING_ENFORCE_PREMIUM: "1 enables premium feature gating for analytics modules.",
+  BILLING_TRIAL_DAYS: "Default trial length for onboarding trial start."
 };
 
 function envCategory(key: string) {
@@ -1192,17 +1327,27 @@ async function persistBillingWebhookEvent(
   provider: "stripe" | "razorpay",
   eventId: string,
   eventType: string,
+  tenantId: string,
   payload: Record<string, unknown>
 ) {
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) {
-    return;
+    return { deduped: false };
   }
   const persistence = new PostgresPersistence(databaseUrl);
   await persistence.init();
+  const dedupeKey = tenantKey(tenantId, "billing_webhook_processed_ids");
+  const processedRaw = await persistence.loadSystemState(dedupeKey);
+  const processedParsed = parseJsonSafe(processedRaw ?? "");
+  const processed = Array.isArray(processedParsed) ? processedParsed.map((x) => String(x)) : [];
+  const dedupeId = `${provider}:${eventId}:${eventType}`;
+  if (processed.includes(dedupeId)) {
+    return { deduped: true };
+  }
   const info = deriveBillingEventInfo(provider, eventType, payload);
   const item = {
     receivedAt: new Date().toISOString(),
+    tenantId,
     provider,
     eventId: eventId || "unknown",
     eventType: eventType || "unknown",
@@ -1211,12 +1356,30 @@ async function persistBillingWebhookEvent(
     amountInr: info.amountInr,
     payload
   };
-  const existingRaw = await persistence.loadSystemState("billing_webhook_events");
+  const existingRaw = await persistence.loadSystemState(tenantKey(tenantId, "billing_webhook_events"));
   const existing = parseJsonSafe(existingRaw ?? "");
   const events = Array.isArray(existing) ? existing : [];
   const next = [item, ...events].slice(0, 50);
-  await persistence.upsertSystemState("billing_webhook_events", JSON.stringify(next));
-  await persistence.upsertSystemState("billing_webhook_last", JSON.stringify(item));
+  await persistence.upsertSystemState(tenantKey(tenantId, "billing_webhook_events"), JSON.stringify(next));
+  await persistence.upsertSystemState(tenantKey(tenantId, "billing_webhook_last"), JSON.stringify(item));
+  await persistence.upsertSystemState(dedupeKey, JSON.stringify([dedupeId, ...processed].slice(0, 500)));
+  await applySubscriptionTransition(tenantId, provider, eventType, payload);
+  await appendAuditEvent(tenantId, "billing_webhook_processed", {
+    provider,
+    eventId,
+    eventType,
+    status: info.status,
+    reason: info.reason
+  });
+  if (info.status === "failed") {
+    await notifyOpsAlert("critical", "billing_payment_failed", `Billing payment failed (${provider})`, {
+      tenantId,
+      eventId,
+      eventType,
+      reason: info.reason
+    });
+  }
+  return { deduped: false };
 }
 
 function deriveBillingEventInfo(
@@ -1262,21 +1425,195 @@ function deriveBillingEventInfo(
   return { status: "pending", reason: "", amountInr };
 }
 
-async function getBillingWebhookEvents() {
+async function getBillingWebhookEvents(tenantId: string) {
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) {
-    return { enabled: false, events: [] };
+    return { enabled: false, tenantId, events: [] };
   }
   const persistence = new PostgresPersistence(databaseUrl);
   try {
     await persistence.init();
-    const raw = await persistence.loadSystemState("billing_webhook_events");
+    const raw = await persistence.loadSystemState(tenantKey(tenantId, "billing_webhook_events"));
     const parsed = parseJsonSafe(raw ?? "");
     const events = Array.isArray(parsed) ? parsed : [];
-    return { enabled: true, events };
+    return { enabled: true, tenantId, events };
   } catch (err) {
     maybeLogDbError(err);
-    return { enabled: false, events: [] };
+    return { enabled: false, tenantId, events: [] };
+  }
+}
+
+async function getSubscriptionState(tenantId: string): Promise<SubscriptionState> {
+  const fallback: SubscriptionState = {
+    tenantId,
+    status: "none",
+    planId: "",
+    source: "manual",
+    updatedAt: new Date(0).toISOString(),
+    premiumEnabled: false
+  };
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) {
+    return fallback;
+  }
+  const persistence = new PostgresPersistence(databaseUrl);
+  try {
+    await persistence.init();
+    const raw = await persistence.loadSystemState(tenantKey(tenantId, "billing_subscription"));
+    const parsed = parseJsonSafe(raw ?? "");
+    if (!parsed || typeof parsed !== "object") {
+      return fallback;
+    }
+    const obj = parsed as Partial<SubscriptionState>;
+    return {
+      tenantId,
+      status: (obj.status as SubscriptionState["status"]) ?? "none",
+      planId: String(obj.planId ?? ""),
+      customerId: obj.customerId ? String(obj.customerId) : undefined,
+      subscriptionId: obj.subscriptionId ? String(obj.subscriptionId) : undefined,
+      source: (obj.source as SubscriptionState["source"]) ?? "manual",
+      currentPeriodEnd: obj.currentPeriodEnd ? String(obj.currentPeriodEnd) : undefined,
+      trialEndsAt: obj.trialEndsAt ? String(obj.trialEndsAt) : undefined,
+      updatedAt: String(obj.updatedAt ?? fallback.updatedAt),
+      lastEventType: obj.lastEventType ? String(obj.lastEventType) : undefined,
+      premiumEnabled: obj.premiumEnabled === true
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+async function upsertSubscriptionState(tenantId: string, patch: Partial<SubscriptionState>) {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) {
+    return;
+  }
+  const persistence = new PostgresPersistence(databaseUrl);
+  await persistence.init();
+  const current = await getSubscriptionState(tenantId);
+  const next: SubscriptionState = {
+    ...current,
+    ...patch,
+    tenantId,
+    updatedAt: patch.updatedAt ?? new Date().toISOString(),
+    premiumEnabled:
+      patch.premiumEnabled ??
+      current.premiumEnabled ??
+      ["active", "trialing"].includes((patch.status ?? current.status) as string)
+  };
+  await persistence.upsertSystemState(tenantKey(tenantId, "billing_subscription"), JSON.stringify(next));
+}
+
+async function hasPremiumAccess(tenantId: string) {
+  if (process.env.BILLING_ENFORCE_PREMIUM !== "1") {
+    return true;
+  }
+  const sub = await getSubscriptionState(tenantId);
+  return sub.premiumEnabled === true || sub.status === "active" || sub.status === "trialing";
+}
+
+async function applySubscriptionTransition(
+  tenantId: string,
+  provider: "stripe" | "razorpay",
+  eventType: string,
+  payload: Record<string, unknown>
+) {
+  const current = await getSubscriptionState(tenantId);
+  let status = current.status;
+  let premium = current.premiumEnabled;
+  if (provider === "stripe") {
+    if (eventType.includes("completed") || eventType.includes("succeeded")) {
+      status = "active";
+      premium = true;
+    } else if (eventType.includes("payment_failed")) {
+      status = "past_due";
+      premium = false;
+    } else if (eventType.includes("canceled") || eventType.includes("deleted")) {
+      status = "canceled";
+      premium = false;
+    }
+  } else {
+    if (eventType.includes("captured") || eventType.includes("paid")) {
+      status = "active";
+      premium = true;
+    } else if (eventType.includes("failed")) {
+      status = "past_due";
+      premium = false;
+    } else if (eventType.includes("cancelled")) {
+      status = "canceled";
+      premium = false;
+    }
+  }
+  await upsertSubscriptionState(tenantId, {
+    status,
+    premiumEnabled: premium,
+    source: "webhook",
+    lastEventType: eventType,
+    customerId: extractBillingCustomerId(provider, payload) ?? current.customerId,
+    subscriptionId: extractBillingSubscriptionId(provider, payload) ?? current.subscriptionId
+  });
+}
+
+function extractBillingCustomerId(provider: "stripe" | "razorpay", payload: Record<string, unknown>) {
+  if (provider === "stripe") {
+    const obj = ((payload.data as Record<string, unknown> | undefined)?.object ??
+      {}) as Record<string, unknown>;
+    const id = obj.customer;
+    return id ? String(id) : undefined;
+  }
+  const paymentEntity =
+    (((payload.payload as Record<string, unknown> | undefined)?.payment as Record<string, unknown> | undefined)
+      ?.entity ?? {}) as Record<string, unknown>;
+  const contact = paymentEntity.contact ?? paymentEntity.email;
+  return contact ? String(contact) : undefined;
+}
+
+function extractBillingSubscriptionId(provider: "stripe" | "razorpay", payload: Record<string, unknown>) {
+  if (provider === "stripe") {
+    const obj = ((payload.data as Record<string, unknown> | undefined)?.object ??
+      {}) as Record<string, unknown>;
+    const sub = obj.subscription;
+    return sub ? String(sub) : undefined;
+  }
+  const subEntity =
+    (((payload.payload as Record<string, unknown> | undefined)?.subscription as Record<string, unknown> | undefined)
+      ?.entity ?? {}) as Record<string, unknown>;
+  const id = subEntity.id;
+  return id ? String(id) : undefined;
+}
+
+async function appendAuditEvent(tenantId: string, action: string, detail: unknown) {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) {
+    return;
+  }
+  const persistence = new PostgresPersistence(databaseUrl);
+  await persistence.init();
+  const key = tenantKey(tenantId, "audit_events");
+  const raw = await persistence.loadSystemState(key);
+  const parsed = parseJsonSafe(raw ?? "");
+  const rows = Array.isArray(parsed) ? parsed : [];
+  const entry = {
+    at: new Date().toISOString(),
+    action,
+    detail
+  };
+  await persistence.upsertSystemState(key, JSON.stringify([entry, ...rows].slice(0, 200)));
+}
+
+async function getAuditEvents(tenantId: string) {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) {
+    return { enabled: false, tenantId, events: [] };
+  }
+  const persistence = new PostgresPersistence(databaseUrl);
+  try {
+    await persistence.init();
+    const raw = await persistence.loadSystemState(tenantKey(tenantId, "audit_events"));
+    const parsed = parseJsonSafe(raw ?? "");
+    return { enabled: true, tenantId, events: Array.isArray(parsed) ? parsed : [] };
+  } catch {
+    return { enabled: false, tenantId, events: [] };
   }
 }
 
