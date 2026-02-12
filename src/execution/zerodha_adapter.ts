@@ -105,17 +105,22 @@ export class ZerodhaAdapter {
     }
     const json = (await res.json()) as {
       data?: {
-        available?: { cash?: number; live_balance?: number; opening_balance?: number };
+        available?: {
+          cash?: number;
+          live_balance?: number;
+          opening_balance?: number;
+          intraday_payin?: number;
+        };
         net?: number;
       };
     };
-    const availableCash = Number(
-      json.data?.available?.cash ??
-        json.data?.available?.live_balance ??
-        json.data?.available?.opening_balance ??
-        0
-    );
-    const net = Number(json.data?.net ?? availableCash);
+    const net = Number(json.data?.net ?? 0);
+    const liveBalance = Number(json.data?.available?.live_balance ?? 0);
+    const cash = Number(json.data?.available?.cash ?? 0);
+    const intradayPayin = Number(json.data?.available?.intraday_payin ?? 0);
+    const openingBalance = Number(json.data?.available?.opening_balance ?? 0);
+    // Prefer broker net/live balance because "cash" can exclude same-day payin.
+    const availableCash = Math.max(net, liveBalance, cash + intradayPayin, openingBalance);
     return {
       availableCash: Number.isFinite(availableCash) ? availableCash : 0,
       net: Number.isFinite(net) ? net : 0,
