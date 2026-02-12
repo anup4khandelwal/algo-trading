@@ -90,6 +90,13 @@ npm run ui
 ```
 When `dashboard/dist/index.html` exists, `npm run ui` serves React UI by default.
 
+Pages in the SaaS-style dashboard:
+- `Overview`: health, pre-open checklist, equity/funds trend, ops events
+- `Trading`: execution actions, positions, orderbook, GTT
+- `Analytics`: strategy, backtest, strategy lab, drift, journal
+- `Config`: runtime controls, profile automation, `.env` editor
+- `Billing`: product plans and checkout launcher
+
 ## Profile Automation (Phase 1 / 2 / 3)
 - Profile templates are stored in:
   - `profiles/phase1.env`
@@ -158,6 +165,11 @@ Use these env controls before enabling live orders:
   - `TELEGRAM_CHAT_ID`
 - `LIVE_CHECK_MARKET_POLICY=warn|strict` (`strict` fails checklist outside 09:15-15:30 IST)
 - `GTT_PROTECTION_ENABLED=1` enables broker-native OCO protection (target + stop) after entry.
+- Optional payment gateway wiring for SaaS:
+  - `PAYMENT_PROVIDER=none|stripe|razorpay`
+  - `PAYMENT_CHECKOUT_BASE_URL=<your hosted checkout url>`
+  - `PAYMENT_SUCCESS_URL`, `PAYMENT_CANCEL_URL`
+  - optional custom plans JSON: `PAYMENT_PLANS_JSON`
 
 ## Backtest
 Set optional env (or keep defaults):

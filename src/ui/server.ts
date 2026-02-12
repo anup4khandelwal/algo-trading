@@ -86,6 +86,20 @@ type EnvConfigPayload = {
     description: string;
   }>;
 };
+type BillingConfigPayload = {
+  provider: string;
+  enabled: boolean;
+  publishableKey?: string;
+  checkoutUrl?: string;
+  plans: Array<{
+    id: string;
+    name: string;
+    amountInr: number;
+    interval: string;
+    features: string[];
+    recommended?: boolean;
+  }>;
+};
 let runningJob: UiJob | null = null;
 let lastDbErrorLogAt = 0;
 let lastTokenRiskAlertAt = 0;
@@ -452,6 +466,38 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (method === "GET" && url.pathname === "/api/billing/config") {
+      const cfg = getBillingConfig();
+      json(res, 200, cfg);
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/api/billing/checkout") {
+      const body = await readJsonBody(req);
+      const planId = String(body?.planId ?? "").trim();
+      const cfg = getBillingConfig();
+      if (!cfg.enabled) {
+        json(res, 400, { ok: false, error: "Payment provider is not enabled" });
+        return;
+      }
+      if (!planId) {
+        json(res, 400, { ok: false, error: "planId is required" });
+        return;
+      }
+      const plan = cfg.plans.find((x) => x.id === planId);
+      if (!plan) {
+        json(res, 400, { ok: false, error: `Unknown plan: ${planId}` });
+        return;
+      }
+      const url = buildCheckoutUrl(cfg.provider, plan.id);
+      if (!url) {
+        json(res, 400, { ok: false, error: "Checkout URL is not configured" });
+        return;
+      }
+      json(res, 200, { ok: true, url, provider: cfg.provider, planId: plan.id });
+      return;
+    }
+
     if (method === "GET" && url.pathname === "/api/eod-summary") {
       const summary = await getLastEodSummary();
       json(res, 200, summary);
@@ -677,6 +723,77 @@ async function getEnvConfig(): Promise<EnvConfigPayload> {
       description: ENV_DESCRIPTIONS[key] ?? "Runtime environment setting."
     }))
   };
+}
+
+function getBillingConfig(): BillingConfigPayload {
+  const provider = String(process.env.PAYMENT_PROVIDER ?? "none").trim().toLowerCase();
+  const plans = parseBillingPlans(process.env.PAYMENT_PLANS_JSON);
+  const publishableKey =
+    provider === "stripe"
+      ? process.env.STRIPE_PUBLISHABLE_KEY
+      : provider === "razorpay"
+        ? process.env.RAZORPAY_KEY_ID
+        : undefined;
+  const checkoutUrl = process.env.PAYMENT_CHECKOUT_BASE_URL;
+  return {
+    provider,
+    enabled: provider !== "none" && Boolean(checkoutUrl),
+    publishableKey: publishableKey || undefined,
+    checkoutUrl: checkoutUrl || undefined,
+    plans
+  };
+}
+
+function parseBillingPlans(raw: string | undefined): BillingConfigPayload["plans"] {
+  if (raw && raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw) as BillingConfigPayload["plans"];
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        return parsed;
+      }
+    } catch {
+      // fall through to defaults
+    }
+  }
+  return [
+    {
+      id: "starter",
+      name: "Starter",
+      amountInr: 1499,
+      interval: "month",
+      features: ["Live dashboard", "Morning/Monitor automation", "Broker orderbook"]
+    },
+    {
+      id: "pro",
+      name: "Pro",
+      amountInr: 3999,
+      interval: "month",
+      recommended: true,
+      features: ["Everything in Starter", "Strategy Lab", "Drift analytics", "PnL attribution"]
+    },
+    {
+      id: "desk",
+      name: "Desk",
+      amountInr: 9999,
+      interval: "month",
+      features: ["Everything in Pro", "Priority support", "White-label options"]
+    }
+  ];
+}
+
+function buildCheckoutUrl(provider: string, planId: string) {
+  const base = process.env.PAYMENT_CHECKOUT_BASE_URL;
+  if (!base) {
+    return "";
+  }
+  const success = process.env.PAYMENT_SUCCESS_URL;
+  const cancel = process.env.PAYMENT_CANCEL_URL;
+  const url = new URL(base);
+  url.searchParams.set("provider", provider);
+  url.searchParams.set("plan", planId);
+  if (success) url.searchParams.set("success_url", success);
+  if (cancel) url.searchParams.set("cancel_url", cancel);
+  return url.toString();
 }
 
 async function hydrateSafeModeFromDb() {
