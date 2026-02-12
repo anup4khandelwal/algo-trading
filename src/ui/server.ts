@@ -29,6 +29,7 @@ import {
   applyEnvOverrides,
   applyProfile,
   getProfileSnapshot,
+  loadCurrentEnvMap,
   type ProfileName
 } from "../config/profile_manager.js";
 
@@ -74,6 +75,16 @@ type PreopenChecklist = {
   ok: boolean;
   checkedAt: string;
   checks: Array<{ key: string; ok: boolean; message: string }>;
+};
+type EnvConfigPayload = {
+  updatedAt: string;
+  items: Array<{
+    key: string;
+    value: string;
+    sensitive: boolean;
+    category: string;
+    description: string;
+  }>;
 };
 let runningJob: UiJob | null = null;
 let lastDbErrorLogAt = 0;
@@ -410,6 +421,37 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (method === "GET" && url.pathname === "/api/env/config") {
+      const envConfig = await getEnvConfig();
+      json(res, 200, envConfig);
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/api/env/config") {
+      const body = await readJsonBody(req);
+      const updatesInput = body?.updates as Record<string, unknown> | undefined;
+      if (!updatesInput || typeof updatesInput !== "object") {
+        json(res, 400, { error: "updates object is required" });
+        return;
+      }
+      const updates: Record<string, string> = {};
+      for (const [rawKey, rawValue] of Object.entries(updatesInput)) {
+        const key = sanitizeEnvKey(rawKey);
+        if (!key) {
+          continue;
+        }
+        updates[key] = String(rawValue ?? "");
+      }
+      if (Object.keys(updates).length === 0) {
+        json(res, 400, { error: "no valid env keys provided" });
+        return;
+      }
+      const applied = await applyEnvOverrides(updates);
+      const restartRequired = Object.keys(updates).some((key) => ENV_RESTART_REQUIRED_KEYS.has(key));
+      json(res, 200, { ok: true, applied, restartRequired });
+      return;
+    }
+
     if (method === "GET" && url.pathname === "/api/eod-summary") {
       const summary = await getLastEodSummary();
       json(res, 200, summary);
@@ -560,6 +602,81 @@ function contentTypeForPath(filePath: string) {
   if (filePath.endsWith(".ico")) return "image/x-icon";
   if (filePath.endsWith(".png")) return "image/png";
   return "application/octet-stream";
+}
+
+const ENV_SENSITIVE_KEYS = new Set([
+  "DATABASE_URL",
+  "KITE_API_SECRET",
+  "KITE_ACCESS_TOKEN",
+  "TELEGRAM_BOT_TOKEN",
+  "TELEGRAM_CHAT_ID"
+]);
+
+const ENV_RESTART_REQUIRED_KEYS = new Set([
+  "UI_PORT",
+  "SCHEDULER_TICK_SECONDS",
+  "SCHEDULER_PREMARKET_AT",
+  "SCHEDULER_MONITOR_INTERVAL_SECONDS",
+  "SCHEDULER_EOD_AT",
+  "SCHEDULER_BACKTEST_WEEKDAY",
+  "SCHEDULER_BACKTEST_AT",
+  "SCHEDULER_STRATLAB_WEEKDAY",
+  "SCHEDULER_STRATLAB_AT"
+]);
+
+const ENV_DESCRIPTIONS: Record<string, string> = {
+  ACTIVE_PROFILE: "Current risk profile preset.",
+  FUND_USAGE_PCT: "Fraction of available cash used for position sizing.",
+  RISK_PER_TRADE: "Risk budget per trade as % of usable equity.",
+  MIN_CAPITAL_DEPLOY_PCT: "Optional minimum capital deployment floor per order.",
+  MAX_DAILY_LOSS: "Daily stop-loss cap before new entries are blocked.",
+  MAX_OPEN_POSITIONS: "Maximum simultaneous open symbols.",
+  MAX_ORDERS_PER_DAY: "Max allowed new orders per day.",
+  MAX_EXPOSURE_PER_SYMBOL: "Max notional exposure per symbol.",
+  MAX_NOTIONAL_PER_ORDER: "Max notional value per single order.",
+  LIVE_ORDER_MODE: "1 enables live broker order placement.",
+  CONFIRM_LIVE_ORDERS: "Must be YES to allow live order execution.",
+  HALT_TRADING: "1 blocks new entries (Safe Mode).",
+  ALLOWED_SYMBOLS: "Comma-separated tradable symbols universe.",
+  STRATEGY_MIN_RSI: "Minimum RSI threshold for long setups.",
+  STRATEGY_MIN_VOLUME_RATIO: "Minimum relative volume ratio filter.",
+  STRATEGY_MAX_SIGNALS: "Maximum signals considered in one run.",
+  STRATEGY_BREAKOUT_BUFFER_PCT: "How close to 20D high qualifies as breakout.",
+  ATR_STOP_MULTIPLE: "Initial stop distance as ATR multiple.",
+  ATR_TRAILING_MULTIPLE: "Trailing stop ATR multiple in monitor loop."
+};
+
+function envCategory(key: string) {
+  if (key.startsWith("KITE_") || key.startsWith("BROKER_")) return "broker";
+  if (key.startsWith("DB_") || key === "DATABASE_URL") return "database";
+  if (key.startsWith("SCHEDULER_")) return "scheduler";
+  if (key.startsWith("STRATEGY_") || key.startsWith("ATR_") || key.startsWith("SCREENER_")) return "strategy";
+  if (key.startsWith("BACKTEST_") || key.startsWith("STRATLAB_")) return "research";
+  if (key.startsWith("MAX_") || key.includes("RISK") || key.includes("LOSS")) return "risk";
+  return "general";
+}
+
+function sanitizeEnvKey(rawKey: string) {
+  const key = String(rawKey ?? "").trim().toUpperCase();
+  if (!/^[A-Z][A-Z0-9_]{0,79}$/.test(key)) {
+    return "";
+  }
+  return key;
+}
+
+async function getEnvConfig(): Promise<EnvConfigPayload> {
+  const current = await loadCurrentEnvMap();
+  const keys = Object.keys(current).sort((a, b) => a.localeCompare(b));
+  return {
+    updatedAt: new Date().toISOString(),
+    items: keys.map((key) => ({
+      key,
+      value: current[key] ?? "",
+      sensitive: ENV_SENSITIVE_KEYS.has(key) || key.endsWith("_TOKEN") || key.endsWith("_SECRET"),
+      category: envCategory(key),
+      description: ENV_DESCRIPTIONS[key] ?? "Runtime environment setting."
+    }))
+  };
 }
 
 async function hydrateSafeModeFromDb() {

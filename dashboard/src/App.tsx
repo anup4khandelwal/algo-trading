@@ -198,6 +198,17 @@ type ProfileRecommendationPayload = {
   generatedAt: string;
 };
 
+type EnvConfigPayload = {
+  updatedAt: string;
+  items: Array<{
+    key: string;
+    value: string;
+    sensitive: boolean;
+    category: string;
+    description: string;
+  }>;
+};
+
 type PreopenPayload = {
   ok: boolean;
   checkedAt: string;
@@ -327,6 +338,10 @@ const fallbackProfileRec: ProfileRecommendationPayload = {
   autoSwitchAllowed: false,
   generatedAt: new Date(0).toISOString()
 };
+const fallbackEnvConfig: EnvConfigPayload = {
+  updatedAt: new Date(0).toISOString(),
+  items: []
+};
 const fallbackPreopen: PreopenPayload = { ok: false, checkedAt: new Date(0).toISOString(), checks: [] };
 const fallbackEodSummary: EodSummaryPayload = { available: false, summary: null };
 const fallbackMorningPreview: MorningPreviewPayload = {
@@ -360,6 +375,7 @@ export default function App() {
   const [journal, setJournal] = useState<JournalPayload>(fallbackJournal);
   const [profileStatus, setProfileStatus] = useState<ProfileStatusPayload>(fallbackProfileStatus);
   const [profileRec, setProfileRec] = useState<ProfileRecommendationPayload>(fallbackProfileRec);
+  const [envConfig, setEnvConfig] = useState<EnvConfigPayload>(fallbackEnvConfig);
   const [preopen, setPreopen] = useState<PreopenPayload>(fallbackPreopen);
   const [eodSummary, setEodSummary] = useState<EodSummaryPayload>(fallbackEodSummary);
   const [pnlAttrib, setPnlAttrib] = useState<PnlAttributionPayload>(fallbackPnlAttribution);
@@ -387,6 +403,10 @@ export default function App() {
   const [journalScreenshot, setJournalScreenshot] = useState("");
   const [journalMsg, setJournalMsg] = useState("");
   const [strategyLabMsg, setStrategyLabMsg] = useState("");
+  const [envDraft, setEnvDraft] = useState<Record<string, string>>({});
+  const [envFilter, setEnvFilter] = useState("");
+  const [envMsg, setEnvMsg] = useState("");
+  const [showSecrets, setShowSecrets] = useState(false);
 
   const safeModeOn = status.safeMode?.enabled === true;
 
@@ -409,7 +429,7 @@ export default function App() {
   }
 
   async function load() {
-    const [s, r, h, b, st, bt, sl, dr, jr, pa, gttRows, ps, pr, po, eod] = await Promise.all([
+    const [s, r, h, b, st, bt, sl, dr, jr, pa, gttRows, ps, pr, env, po, eod] = await Promise.all([
       fetchJson<StatusPayload>("/api/status", fallbackStatus),
       fetchJson<ReportPayload>("/api/report", fallbackReport),
       fetchJson<HealthPayload>("/api/health", fallbackHealth),
@@ -423,6 +443,7 @@ export default function App() {
       fetchJson<GttPayload>("/api/gtt/status", fallbackGtt),
       fetchJson<ProfileStatusPayload>("/api/profile/status", fallbackProfileStatus),
       fetchJson<ProfileRecommendationPayload>("/api/profile/recommendation", fallbackProfileRec),
+      fetchJson<EnvConfigPayload>("/api/env/config", fallbackEnvConfig),
       fetchJson<PreopenPayload>("/api/preopen-check", fallbackPreopen),
       fetchJson<EodSummaryPayload>("/api/eod-summary", fallbackEodSummary)
     ]);
@@ -439,6 +460,17 @@ export default function App() {
     setGtt(gttRows);
     setProfileStatus(ps);
     setProfileRec(pr);
+    setEnvConfig(env);
+    setEnvDraft((prev) => {
+      if (Object.keys(prev).length > 0) {
+        return prev;
+      }
+      const next: Record<string, string> = {};
+      for (const item of env.items ?? []) {
+        next[item.key] = item.value;
+      }
+      return next;
+    });
     setPreopen(po);
     setEodSummary(eod);
     setLastRefresh(new Date().toLocaleString("en-IN"));
@@ -644,6 +676,52 @@ export default function App() {
     }
   }
 
+  async function reloadEnvEditor() {
+    const latest = await fetchJson<EnvConfigPayload>("/api/env/config", fallbackEnvConfig);
+    setEnvConfig(latest);
+    const next: Record<string, string> = {};
+    for (const item of latest.items ?? []) {
+      next[item.key] = item.value;
+    }
+    setEnvDraft(next);
+    setEnvMsg(`Reloaded ${latest.items.length} keys.`);
+  }
+
+  async function saveEnvChanges() {
+    const updates: Record<string, string> = {};
+    for (const item of envConfig.items ?? []) {
+      const nextValue = envDraft[item.key] ?? "";
+      if (nextValue !== item.value) {
+        updates[item.key] = nextValue;
+      }
+    }
+    const keys = Object.keys(updates);
+    if (keys.length === 0) {
+      setEnvMsg("No changes to save.");
+      return;
+    }
+    setBusy(true);
+    try {
+      const res = await fetch("/api/env/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ updates })
+      });
+      const body = (await res.json()) as { error?: string; ok?: boolean; restartRequired?: boolean };
+      if (!res.ok || body.ok !== true) {
+        setEnvMsg(body.error ?? "Save failed");
+        return;
+      }
+      await reloadEnvEditor();
+      setEnvMsg(
+        `Saved ${keys.length} keys.${body.restartRequired ? " Restart UI process to apply scheduler/port changes." : ""}`
+      );
+      await load();
+    } finally {
+      setBusy(false);
+    }
+  }
+
   const eqPoints = useMemo(() => {
     const rows = [...(report.dailySnapshots ?? [])].reverse();
     if (rows.length < 2) return "";
@@ -680,6 +758,29 @@ export default function App() {
   }, [report.fundsHistory]);
 
   const blockedSymbols = Object.entries(report.rejectGuard?.blockedSymbols ?? {});
+  const envFilteredItems = useMemo(() => {
+    const query = envFilter.trim().toLowerCase();
+    if (!query) {
+      return envConfig.items ?? [];
+    }
+    return (envConfig.items ?? []).filter((item) => {
+      return (
+        item.key.toLowerCase().includes(query) ||
+        item.category.toLowerCase().includes(query) ||
+        item.description.toLowerCase().includes(query)
+      );
+    });
+  }, [envConfig.items, envFilter]);
+
+  const envChangedCount = useMemo(() => {
+    let count = 0;
+    for (const item of envConfig.items ?? []) {
+      if ((envDraft[item.key] ?? "") !== item.value) {
+        count += 1;
+      }
+    }
+    return count;
+  }, [envConfig.items, envDraft]);
 
   return (
     <div className="app-shell">
@@ -761,6 +862,58 @@ export default function App() {
           <SimpleTable columns={["control", "value"]} rows={Object.entries(profileStatus.controls ?? {}).map(([k, v]) => [k, v])} />
           <SimpleTable columns={["reasons"]} rows={(profileRec.reasons ?? []).map((x) => [x])} />
           <SimpleTable columns={["blockers"]} rows={(profileRec.blockers ?? []).map((x) => [x])} />
+        </Card>
+
+        <Card title=".env Config Editor" span="wide" subtitle={`Keys: ${envConfig.items.length} | Updated: ${new Date(envConfig.updatedAt).toLocaleString("en-IN")}`}>
+          <div className="filters env-filters">
+            <input
+              value={envFilter}
+              onChange={(e) => setEnvFilter(e.target.value)}
+              placeholder="Search key/category/description"
+            />
+            <button className="btn" disabled={busy} onClick={() => void reloadEnvEditor()}>Reload .env</button>
+            <button className="btn" disabled={busy} onClick={() => setShowSecrets((v) => !v)}>
+              {showSecrets ? "Hide Secrets" : "Show Secrets"}
+            </button>
+            <button className="btn btn-primary" disabled={busy || envChangedCount === 0} onClick={() => void saveEnvChanges()}>
+              Save Changes ({envChangedCount})
+            </button>
+          </div>
+          <div className="meta-line">
+            {envMsg || "Edit values and click Save Changes. Sensitive keys are masked by default."}
+          </div>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>key</th>
+                  <th>value</th>
+                  <th>category</th>
+                  <th>description</th>
+                </tr>
+              </thead>
+              <tbody>
+                {envFilteredItems.slice(0, 200).map((item) => (
+                  <tr key={item.key}>
+                    <td>{item.key}</td>
+                    <td>
+                      <input
+                        className="env-input"
+                        type={item.sensitive && !showSecrets ? "password" : "text"}
+                        value={envDraft[item.key] ?? ""}
+                        onChange={(e) => {
+                          const next = e.target.value;
+                          setEnvDraft((prev) => ({ ...prev, [item.key]: next }));
+                        }}
+                      />
+                    </td>
+                    <td>{item.category}</td>
+                    <td>{item.description}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </Card>
 
         <Card title="Pre-Open Checklist" subtitle={`Checked: ${new Date(preopen.checkedAt).toLocaleString("en-IN")}`}>
