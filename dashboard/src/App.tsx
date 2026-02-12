@@ -274,6 +274,19 @@ type BillingConfigPayload = {
   }>;
 };
 
+type BillingEventsPayload = {
+  enabled: boolean;
+  events: Array<{
+    receivedAt?: string;
+    provider?: string;
+    eventId?: string;
+    eventType?: string;
+    status?: string;
+    reason?: string;
+    amountInr?: number;
+  }>;
+};
+
 const fallbackStatus: StatusPayload = {
   runningJob: null,
   liveMode: false,
@@ -329,6 +342,7 @@ const fallbackMorningPreview: MorningPreviewPayload = {
 const fallbackPnlAttribution: PnlAttributionPayload = { enabled: false, rows: [], bySymbol: [], bySetup: [] };
 const fallbackGtt: GttPayload = { enabled: false, rows: [] };
 const fallbackBilling: BillingConfigPayload = { provider: "none", enabled: false, plans: [] };
+const fallbackBillingEvents: BillingEventsPayload = { enabled: false, events: [] };
 
 export default function App() {
   const [page, setPage] = useState<PageKey>("overview");
@@ -349,6 +363,7 @@ export default function App() {
   const [pnlAttrib, setPnlAttrib] = useState<PnlAttributionPayload>(fallbackPnlAttribution);
   const [gtt, setGtt] = useState<GttPayload>(fallbackGtt);
   const [billing, setBilling] = useState<BillingConfigPayload>(fallbackBilling);
+  const [billingEvents, setBillingEvents] = useState<BillingEventsPayload>(fallbackBillingEvents);
 
   const [previewOpen, setPreviewOpen] = useState(false);
   const [previewBusy, setPreviewBusy] = useState(false);
@@ -379,6 +394,9 @@ export default function App() {
   const [envMsg, setEnvMsg] = useState("");
   const [showSecrets, setShowSecrets] = useState(false);
   const [billingMsg, setBillingMsg] = useState("");
+  const [billingProviderFilter, setBillingProviderFilter] = useState("all");
+  const [billingStatusFilter, setBillingStatusFilter] = useState("all");
+  const [billingSearch, setBillingSearch] = useState("");
 
   const safeModeOn = status.safeMode?.enabled === true;
 
@@ -401,7 +419,7 @@ export default function App() {
   }
 
   async function load() {
-    const [s, r, h, b, st, bt, sl, dr, jr, pa, gttRows, ps, pr, env, po, eod, bill] = await Promise.all([
+    const [s, r, h, b, st, bt, sl, dr, jr, pa, gttRows, ps, pr, env, po, eod, bill, billEvents] = await Promise.all([
       fetchJson<StatusPayload>("/api/status", fallbackStatus),
       fetchJson<ReportPayload>("/api/report", fallbackReport),
       fetchJson<HealthPayload>("/api/health", fallbackHealth),
@@ -418,7 +436,8 @@ export default function App() {
       fetchJson<EnvConfigPayload>("/api/env/config", fallbackEnvConfig),
       fetchJson<PreopenPayload>("/api/preopen-check", fallbackPreopen),
       fetchJson<EodSummaryPayload>("/api/eod-summary", fallbackEodSummary),
-      fetchJson<BillingConfigPayload>("/api/billing/config", fallbackBilling)
+      fetchJson<BillingConfigPayload>("/api/billing/config", fallbackBilling),
+      fetchJson<BillingEventsPayload>("/api/billing/events", fallbackBillingEvents)
     ]);
 
     setStatus(s);
@@ -438,6 +457,7 @@ export default function App() {
     setPreopen(po);
     setEodSummary(eod);
     setBilling(bill);
+    setBillingEvents(billEvents);
     setLastRefresh(new Date().toLocaleString("en-IN"));
     if (!exitSymbol && (r.positions?.length ?? 0) > 0) {
       setExitSymbol(r.positions?.[0]?.symbol ?? "");
@@ -760,6 +780,22 @@ export default function App() {
     return count;
   }, [envConfig.items, envDraft]);
 
+  const billingEventRows = useMemo(() => {
+    const query = billingSearch.trim().toLowerCase();
+    return (billingEvents.events ?? []).filter((event) => {
+      const providerOk = billingProviderFilter === "all" || (event.provider ?? "unknown") === billingProviderFilter;
+      const statusOk = billingStatusFilter === "all" || (event.status ?? "pending") === billingStatusFilter;
+      if (!providerOk || !statusOk) {
+        return false;
+      }
+      if (!query) {
+        return true;
+      }
+      const hay = `${event.eventId ?? ""} ${event.eventType ?? ""} ${event.reason ?? ""}`.toLowerCase();
+      return hay.includes(query);
+    });
+  }, [billingEvents.events, billingProviderFilter, billingStatusFilter, billingSearch]);
+
   return (
     <div className="shell">
       <aside className="sidebar">
@@ -1047,6 +1083,39 @@ export default function App() {
                 <button className="btn btn-primary" disabled={busy || !billing.enabled} onClick={() => void checkoutPlan(plan.id)}>Start Checkout</button>
               </Card>
             ))}
+            <Card title="Webhook Events" span="wide" subtitle={`Stored: ${(billingEvents.events ?? []).length} latest events`}>
+              <div className="filters">
+                <select value={billingProviderFilter} onChange={(e) => setBillingProviderFilter(e.target.value)}>
+                  <option value="all">Provider: all</option>
+                  <option value="stripe">Stripe</option>
+                  <option value="razorpay">Razorpay</option>
+                </select>
+                <select value={billingStatusFilter} onChange={(e) => setBillingStatusFilter(e.target.value)}>
+                  <option value="all">Status: all</option>
+                  <option value="success">Success</option>
+                  <option value="failed">Failed</option>
+                  <option value="pending">Pending</option>
+                </select>
+                <input
+                  value={billingSearch}
+                  onChange={(e) => setBillingSearch(e.target.value)}
+                  placeholder="Search by event id, event type, reason"
+                />
+                <button className="btn" disabled={busy} onClick={() => void load()}>Reload</button>
+              </div>
+              <SimpleTable
+                columns={["receivedAt", "provider", "eventType", "status", "amount", "reason", "eventId"]}
+                rows={billingEventRows.slice(0, 80).map((x) => [
+                  x.receivedAt ? new Date(x.receivedAt).toLocaleString("en-IN") : "",
+                  x.provider ?? "",
+                  x.eventType ?? "",
+                  (x.status ?? "pending").toUpperCase(),
+                  Number.isFinite(Number(x.amountInr)) ? inr(Number(x.amountInr ?? 0)) : "",
+                  x.reason ?? "",
+                  x.eventId ?? ""
+                ])}
+              />
+            </Card>
           </section>
         ) : null}
       </main>

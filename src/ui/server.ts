@@ -1200,11 +1200,15 @@ async function persistBillingWebhookEvent(
   }
   const persistence = new PostgresPersistence(databaseUrl);
   await persistence.init();
+  const info = deriveBillingEventInfo(provider, eventType, payload);
   const item = {
     receivedAt: new Date().toISOString(),
     provider,
     eventId: eventId || "unknown",
     eventType: eventType || "unknown",
+    status: info.status,
+    reason: info.reason,
+    amountInr: info.amountInr,
     payload
   };
   const existingRaw = await persistence.loadSystemState("billing_webhook_events");
@@ -1213,6 +1217,49 @@ async function persistBillingWebhookEvent(
   const next = [item, ...events].slice(0, 50);
   await persistence.upsertSystemState("billing_webhook_events", JSON.stringify(next));
   await persistence.upsertSystemState("billing_webhook_last", JSON.stringify(item));
+}
+
+function deriveBillingEventInfo(
+  provider: "stripe" | "razorpay",
+  eventType: string,
+  payload: Record<string, unknown>
+) {
+  if (provider === "stripe") {
+    const obj = payload.data as Record<string, unknown> | undefined;
+    const inner = obj?.object as Record<string, unknown> | undefined;
+    const amountCents = Number(inner?.amount_total ?? inner?.amount ?? 0);
+    const amountInr = Number.isFinite(amountCents) ? amountCents / 100 : 0;
+    if (eventType.includes("payment_failed")) {
+      return {
+        status: "failed",
+        reason: String(inner?.last_payment_error ?? payload["failure_message"] ?? "payment_failed"),
+        amountInr
+      };
+    }
+    if (eventType.includes("completed") || eventType.includes("succeeded")) {
+      return { status: "success", reason: "", amountInr };
+    }
+    return { status: "pending", reason: "", amountInr };
+  }
+
+  const payloadRoot = payload.payload as Record<string, unknown> | undefined;
+  const paymentEntity =
+    (payloadRoot?.payment as Record<string, unknown> | undefined)?.entity as
+      | Record<string, unknown>
+      | undefined;
+  const amountPaise = Number(paymentEntity?.amount ?? 0);
+  const amountInr = Number.isFinite(amountPaise) ? amountPaise / 100 : 0;
+  if (eventType.includes("failed")) {
+    return {
+      status: "failed",
+      reason: String(paymentEntity?.error_description ?? paymentEntity?.error_reason ?? "payment_failed"),
+      amountInr
+    };
+  }
+  if (eventType.includes("captured") || eventType.includes("paid") || eventType.includes("charged")) {
+    return { status: "success", reason: "", amountInr };
+  }
+  return { status: "pending", reason: "", amountInr };
 }
 
 async function getBillingWebhookEvents() {

@@ -95,7 +95,7 @@ Pages in the SaaS-style dashboard:
 - `Trading`: execution actions, positions, orderbook, GTT
 - `Analytics`: strategy, backtest, strategy lab, drift, journal
 - `Config`: runtime controls, profile automation, `.env` editor
-- `Billing`: product plans and checkout launcher
+- `Billing`: product plans, checkout launcher, webhook event monitor (status/failure reasons)
 
 ## Profile Automation (Phase 1 / 2 / 3)
 - Profile templates are stored in:
