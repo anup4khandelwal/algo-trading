@@ -1,5 +1,6 @@
 import http from "node:http";
 import path from "node:path";
+import crypto from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import dotenv from "dotenv";
@@ -498,6 +499,72 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (method === "POST" && url.pathname === "/api/billing/webhook/stripe") {
+      const raw = await readRawBody(req);
+      const signature = String(req.headers["stripe-signature"] ?? "");
+      const secret = process.env.STRIPE_WEBHOOK_SECRET;
+      if (!secret) {
+        json(res, 400, { ok: false, error: "STRIPE_WEBHOOK_SECRET is not set" });
+        return;
+      }
+      if (!verifyStripeWebhookSignature(raw, signature, secret)) {
+        json(res, 400, { ok: false, error: "Invalid stripe signature" });
+        return;
+      }
+      const event = parseJsonSafe(raw);
+      if (!event || typeof event !== "object") {
+        json(res, 400, { ok: false, error: "Invalid stripe webhook payload" });
+        return;
+      }
+      const eventObj = event as Record<string, unknown>;
+      await persistBillingWebhookEvent(
+        "stripe",
+        String(eventObj.id ?? ""),
+        String(eventObj.type ?? "unknown"),
+        eventObj
+      );
+      json(res, 200, { ok: true, received: true });
+      return;
+    }
+
+    if (method === "POST" && url.pathname === "/api/billing/webhook/razorpay") {
+      const raw = await readRawBody(req);
+      const signature = String(req.headers["x-razorpay-signature"] ?? "");
+      const secret = process.env.RAZORPAY_WEBHOOK_SECRET ?? process.env.RAZORPAY_KEY_SECRET;
+      if (!secret) {
+        json(res, 400, { ok: false, error: "RAZORPAY_WEBHOOK_SECRET is not set" });
+        return;
+      }
+      if (!verifyRazorpayWebhookSignature(raw, signature, secret)) {
+        json(res, 400, { ok: false, error: "Invalid razorpay signature" });
+        return;
+      }
+      const event = parseJsonSafe(raw);
+      if (!event || typeof event !== "object") {
+        json(res, 400, { ok: false, error: "Invalid razorpay webhook payload" });
+        return;
+      }
+      const eventObj = event as Record<string, unknown>;
+      const payloadEntity = (((eventObj.payload as Record<string, unknown> | undefined)?.payment as Record<string, unknown> | undefined)?.entity ??
+        (eventObj.payload as Record<string, unknown> | undefined)?.subscription) as
+        | Record<string, unknown>
+        | undefined;
+      await persistBillingWebhookEvent(
+        "razorpay",
+        String(payloadEntity?.id ?? eventObj.event ?? ""),
+        String(eventObj.event ?? "unknown"),
+        eventObj
+      );
+      json(res, 200, { ok: true, received: true });
+      return;
+    }
+
+    if (method === "GET" && url.pathname === "/api/billing/events") {
+      const events = await getBillingWebhookEvents();
+      json(res, 200, events);
+      return;
+    }
+
     if (method === "GET" && url.pathname === "/api/eod-summary") {
       const summary = await getLastEodSummary();
       json(res, 200, summary);
@@ -699,8 +766,10 @@ const ENV_DESCRIPTIONS: Record<string, string> = {
   PAYMENT_PLANS_JSON: "Optional JSON array to override default plans.",
   STRIPE_PUBLISHABLE_KEY: "Stripe publishable key for frontend use.",
   STRIPE_SECRET_KEY: "Stripe secret key for checkout session creation.",
+  STRIPE_WEBHOOK_SECRET: "Stripe webhook signing secret for event verification.",
   RAZORPAY_KEY_ID: "Razorpay key id.",
-  RAZORPAY_KEY_SECRET: "Razorpay key secret."
+  RAZORPAY_KEY_SECRET: "Razorpay key secret.",
+  RAZORPAY_WEBHOOK_SECRET: "Razorpay webhook signing secret for event verification."
 };
 
 function envCategory(key: string) {
@@ -1060,15 +1129,108 @@ async function runUiJob(job: UiJob, logTag: string, runner: () => Promise<unknow
 }
 
 async function readJsonBody(req: http.IncomingMessage): Promise<any> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  }
-  const raw = Buffer.concat(chunks).toString("utf-8").trim();
+  const raw = await readRawBody(req);
   if (!raw) {
     return {};
   }
   return JSON.parse(raw);
+}
+
+async function readRawBody(req: http.IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks).toString("utf-8").trim();
+}
+
+function parseJsonSafe(raw: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function verifyStripeWebhookSignature(payload: string, signatureHeader: string, secret: string) {
+  if (!payload || !signatureHeader || !secret) {
+    return false;
+  }
+  const parts = signatureHeader.split(",").map((x) => x.trim());
+  const timestamp = parts.find((x) => x.startsWith("t="))?.slice(2);
+  const signature = parts.find((x) => x.startsWith("v1="))?.slice(3);
+  if (!timestamp || !signature) {
+    return false;
+  }
+  const signedPayload = `${timestamp}.${payload}`;
+  const expected = crypto.createHmac("sha256", secret).update(signedPayload).digest("hex");
+  return timingSafeHexEqual(signature, expected);
+}
+
+function verifyRazorpayWebhookSignature(payload: string, signature: string, secret: string) {
+  if (!payload || !signature || !secret) {
+    return false;
+  }
+  const expected = crypto.createHmac("sha256", secret).update(payload).digest("hex");
+  return timingSafeHexEqual(signature, expected);
+}
+
+function timingSafeHexEqual(actualHex: string, expectedHex: string) {
+  try {
+    const a = Buffer.from(actualHex, "hex");
+    const b = Buffer.from(expectedHex, "hex");
+    if (a.length !== b.length || a.length === 0) {
+      return false;
+    }
+    return crypto.timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
+}
+
+async function persistBillingWebhookEvent(
+  provider: "stripe" | "razorpay",
+  eventId: string,
+  eventType: string,
+  payload: Record<string, unknown>
+) {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) {
+    return;
+  }
+  const persistence = new PostgresPersistence(databaseUrl);
+  await persistence.init();
+  const item = {
+    receivedAt: new Date().toISOString(),
+    provider,
+    eventId: eventId || "unknown",
+    eventType: eventType || "unknown",
+    payload
+  };
+  const existingRaw = await persistence.loadSystemState("billing_webhook_events");
+  const existing = parseJsonSafe(existingRaw ?? "");
+  const events = Array.isArray(existing) ? existing : [];
+  const next = [item, ...events].slice(0, 50);
+  await persistence.upsertSystemState("billing_webhook_events", JSON.stringify(next));
+  await persistence.upsertSystemState("billing_webhook_last", JSON.stringify(item));
+}
+
+async function getBillingWebhookEvents() {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) {
+    return { enabled: false, events: [] };
+  }
+  const persistence = new PostgresPersistence(databaseUrl);
+  try {
+    await persistence.init();
+    const raw = await persistence.loadSystemState("billing_webhook_events");
+    const parsed = parseJsonSafe(raw ?? "");
+    const events = Array.isArray(parsed) ? parsed : [];
+    return { enabled: true, events };
+  } catch (err) {
+    maybeLogDbError(err);
+    return { enabled: false, events: [] };
+  }
 }
 
 async function getDbReport() {

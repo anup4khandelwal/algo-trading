@@ -172,6 +172,13 @@ Use these env controls before enabling live orders:
   - optional custom plans JSON: `PAYMENT_PLANS_JSON`
   - Stripe native session creation: `STRIPE_SECRET_KEY` (+ optional `STRIPE_PUBLISHABLE_KEY`)
   - Razorpay native payment link creation: `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`
+  - Webhook verification secrets:
+    - `STRIPE_WEBHOOK_SECRET`
+    - `RAZORPAY_WEBHOOK_SECRET`
+  - Webhook endpoints:
+    - `POST /api/billing/webhook/stripe`
+    - `POST /api/billing/webhook/razorpay`
+    - `GET /api/billing/events` (latest stored webhook events)
 
 ## Backtest
 Set optional env (or keep defaults):
