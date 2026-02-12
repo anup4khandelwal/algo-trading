@@ -324,6 +324,12 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (method === "POST" && url.pathname === "/api/reject-guard/clear") {
+      const cleared = await clearRejectGuardForToday();
+      json(res, 200, { ok: true, cleared });
+      return;
+    }
+
     if (method === "POST" && url.pathname === "/api/scheduler/start") {
       if (getSafeModeState().enabled) {
         json(res, 409, { error: "Safe Mode is enabled. Disable it before starting scheduler." });
@@ -1962,6 +1968,27 @@ async function recomputeFundsSnapshot() {
     pushRuntimeError("FUNDS_RECOMPUTE", err);
   }
   return snapshot;
+}
+
+async function clearRejectGuardForToday() {
+  const tradeDate = getIstTradeDate();
+  const key = `reject_guard_${tradeDate}`;
+  const cleared = {
+    tradeDate,
+    rejectCounts: {} as Record<string, number>,
+    blockedSymbols: {} as Record<string, { blockedAt: string; reason: string; count: number }>
+  };
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) {
+    throw new Error("DATABASE_URL is not set");
+  }
+  const persistence = new PostgresPersistence(databaseUrl);
+  await persistence.init();
+  await persistence.upsertSystemState(key, JSON.stringify(cleared));
+  await notifyOpsAlert("warning", "reject_guard_cleared", "Reject guard manually cleared for today", {
+    tradeDate
+  });
+  return cleared;
 }
 
 function clamp01(v: number) {

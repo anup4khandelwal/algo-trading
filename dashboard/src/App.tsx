@@ -669,6 +669,16 @@ export default function App() {
         <button disabled={busy} onClick={() => void postAction("/api/run/backtest")} className="btn">Backtest</button>
         <button disabled={busy} onClick={() => void postAction("/api/strategy-lab/run")} className="btn">Strategy Lab</button>
         <button disabled={busy} onClick={() => void postAction("/api/funds/recompute")} className="btn">Recompute Funds</button>
+        <button
+          disabled={busy}
+          onClick={async () => {
+            if (!window.confirm("Clear reject guard for today? This removes blocked symbols for current trade date.")) return;
+            await postAction("/api/reject-guard/clear");
+          }}
+          className="btn"
+        >
+          Clear Reject Guard
+        </button>
         <button disabled={busy} onClick={() => window.open("/api/reports/weekly.pdf", "_blank")} className="btn">Weekly PDF</button>
         <button disabled={busy || safeModeOn} onClick={() => void postAction("/api/scheduler/start")} className="btn">Start Scheduler</button>
         <button disabled={busy} onClick={() => void postAction("/api/scheduler/stop")} className="btn">Stop Scheduler</button>
@@ -981,6 +991,18 @@ export default function App() {
 
         <Card title="Rejection Guard" span="wide">
           <div className="meta-line">Trade Date: {report.rejectGuard?.tradeDate || "n/a"} | Blocked: {blockedSymbols.length}</div>
+          <div className="actions-inline" style={{ marginBottom: 8 }}>
+            <button
+              className="btn"
+              disabled={busy}
+              onClick={async () => {
+                if (!window.confirm("Clear reject guard for today?")) return;
+                await postAction("/api/reject-guard/clear");
+              }}
+            >
+              Clear Guard Today
+            </button>
+          </div>
           <SimpleTable
             columns={["symbol", "count", "blockedAt", "reason"]}
             rows={blockedSymbols.map(([sym, row]) => [
