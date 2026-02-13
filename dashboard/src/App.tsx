@@ -386,9 +386,6 @@ export default function App() {
 
   const [busy, setBusy] = useState(false);
   const [lastRefresh, setLastRefresh] = useState<string>("");
-  const [actionMsg, setActionMsg] = useState("");
-  const [adminToken, setAdminToken] = useState("");
-  const [tenantId, setTenantId] = useState("default");
   const [statusFilter, setStatusFilter] = useState("all");
   const [severityFilter, setSeverityFilter] = useState("all");
   const [searchFilter, setSearchFilter] = useState("");
@@ -413,17 +410,9 @@ export default function App() {
 
   const safeModeOn = status.safeMode?.enabled === true;
 
-  function apiHeaders(withJson = false): HeadersInit {
-    const out: Record<string, string> = {};
-    if (withJson) out["Content-Type"] = "application/json";
-    if (tenantId.trim()) out["x-tenant-id"] = tenantId.trim();
-    if (adminToken.trim()) out["x-admin-token"] = adminToken.trim();
-    return out;
-  }
-
   async function fetchJson<T>(url: string, fallback: T): Promise<T> {
     try {
-      const res = await fetch(url, { headers: apiHeaders(false) });
+      const res = await fetch(url);
       if (!res.ok) return fallback;
       return (await res.json()) as T;
     } catch {
@@ -503,17 +492,11 @@ export default function App() {
   async function postAction(path: string, body?: unknown) {
     setBusy(true);
     try {
-      const res = await fetch(path, {
+      await fetch(path, {
         method: "POST",
-        headers: apiHeaders(Boolean(body)),
+        headers: body ? { "Content-Type": "application/json" } : undefined,
         body: body ? JSON.stringify(body) : undefined
       });
-      if (!res.ok) {
-        const parsed = (await res.json().catch(() => ({}))) as { error?: string };
-        setActionMsg(parsed.error ?? `Action failed (${res.status})`);
-      } else {
-        setActionMsg("Action completed.");
-      }
       await load();
     } finally {
       setBusy(false);
@@ -537,11 +520,7 @@ export default function App() {
   async function confirmMorningRun() {
     setPreviewBusy(true);
     try {
-      const res = await fetch("/api/run/morning", { method: "POST", headers: apiHeaders(false) });
-      if (!res.ok) {
-        const parsed = (await res.json().catch(() => ({}))) as { error?: string };
-        setActionMsg(parsed.error ?? `Morning run failed (${res.status})`);
-      }
+      await fetch("/api/run/morning", { method: "POST" });
       setPreviewOpen(false);
       await load();
     } finally {
@@ -555,7 +534,7 @@ export default function App() {
     try {
       await fetch("/api/gtt/cancel", {
         method: "POST",
-        headers: apiHeaders(true),
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ symbol })
       });
       await load();
@@ -573,7 +552,7 @@ export default function App() {
     try {
       const res = await fetch("/api/position/exit", {
         method: "POST",
-        headers: apiHeaders(true),
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           symbol: exitSymbol,
           percent: full ? 100 : Math.max(1, Math.min(100, Number(exitPercent || 1))),
@@ -603,7 +582,7 @@ export default function App() {
     try {
       const res = await fetch("/api/position/stop", {
         method: "POST",
-        headers: apiHeaders(true),
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ symbol: exitSymbol, stopPrice: Number(stopPrice) })
       });
       const body = (await res.json()) as { error?: string };
@@ -629,7 +608,7 @@ export default function App() {
     try {
       const res = await fetch("/api/journal", {
         method: "POST",
-        headers: apiHeaders(true),
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           lotId,
           symbol: symbolRaw,
@@ -661,7 +640,7 @@ export default function App() {
     try {
       await fetch("/api/profile/switch", {
         method: "POST",
-        headers: apiHeaders(true),
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           profile,
           reason: "React one-click profile switch"
@@ -682,7 +661,7 @@ export default function App() {
     try {
       const res = await fetch("/api/strategy-lab/apply", {
         method: "POST",
-        headers: apiHeaders(true),
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ candidateId })
       });
       const body = (await res.json()) as { error?: string; ok?: boolean };
@@ -725,7 +704,7 @@ export default function App() {
     try {
       const res = await fetch("/api/env/config", {
         method: "POST",
-        headers: apiHeaders(true),
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ updates })
       });
       const body = (await res.json()) as { error?: string; ok?: boolean; restartRequired?: boolean };
@@ -823,19 +802,6 @@ export default function App() {
       </header>
 
       <section className="actions">
-        <input
-          value={tenantId}
-          onChange={(e) => setTenantId(e.target.value)}
-          placeholder="tenant id"
-          style={{ maxWidth: 140 }}
-        />
-        <input
-          type="password"
-          value={adminToken}
-          onChange={(e) => setAdminToken(e.target.value)}
-          placeholder="admin api token"
-          style={{ minWidth: 180 }}
-        />
         <button disabled={busy || safeModeOn || !preopen.ok} onClick={() => void openMorningPreview()} className="btn btn-primary">Morning</button>
         <button disabled={busy} onClick={() => void postAction("/api/run/monitor")} className="btn">Monitor</button>
         <button disabled={busy} onClick={() => void postAction("/api/run/preflight")} className="btn">Preflight</button>
@@ -861,7 +827,6 @@ export default function App() {
         <button disabled={busy || !safeModeOn} onClick={() => void postAction("/api/safe-mode/disable", { reason: "React dashboard toggle" })} className="btn">Disable Safe Mode</button>
         <button disabled={busy} onClick={() => void load()} className="btn">Refresh</button>
       </section>
-      <div className="meta-line">{actionMsg}</div>
 
       <section className="kpis">
         <Kpi label={`Usable Funds (${report.funds?.source ?? "n/a"})`} value={report.funds ? inr(report.funds.usableEquity) : "n/a"} />
