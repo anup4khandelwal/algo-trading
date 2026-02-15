@@ -45,7 +45,24 @@ Pipeline parity commands:
 algo-trading-py morning
 algo-trading-py morning-preview --symbols INFY,TCS
 algo-trading-py preflight
+algo-trading-py entry
 algo-trading-py monitor
 algo-trading-py reconcile
 algo-trading-py eod-close
+algo-trading-py live-loop --interval-seconds 120
 ```
+
+Operational API parity endpoints now include:
+- `GET /api/status`
+- `GET /api/scheduler`
+- `GET /api/screener`
+- `GET /api/morning/preview`
+- `POST /api/run/morning`
+- `POST /api/run/entry`
+- `POST /api/run/monitor`
+- `POST /api/run/reconcile`
+- `POST /api/run/eod`
+- `POST /api/run/preflight`
+- `POST /api/run/live-loop`
+- `POST /api/scheduler/start`
+- `POST /api/scheduler/stop`

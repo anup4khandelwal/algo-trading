@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from dotenv import load_dotenv
 
 from algo_trading_py.config import kite_config_from_env
+from algo_trading_py.execution.live_kite import LiveKiteExecutionAdapter
 from algo_trading_py.execution.paper import PaperExecutionAdapter
 from algo_trading_py.market_data.kite_historical_provider import KiteHistoricalProvider
 from algo_trading_py.monitor.position_monitor import PositionMonitor
@@ -27,7 +28,7 @@ class Runtime:
   provider: KiteHistoricalProvider
   risk: RiskEngine
   signal_builder: SignalBuilder
-  execution: PaperExecutionAdapter
+  execution: PaperExecutionAdapter | LiveKiteExecutionAdapter
   monitor: PositionMonitor
 
 
@@ -69,13 +70,26 @@ def create_runtime() -> Runtime:
       max_signals=int(os.getenv("STRATEGY_MAX_SIGNALS", "5")),
     )
   )
+  live_mode = os.getenv("LIVE_ORDER_MODE", "0") == "1" and os.getenv("CONFIRM_LIVE_ORDERS", "") == "YES"
+  execution: PaperExecutionAdapter | LiveKiteExecutionAdapter
+  if live_mode:
+    execution = LiveKiteExecutionAdapter(
+      api_key=cfg.api_key,
+      access_token=cfg.access_token,
+      base_url=cfg.base_url,
+      exchange=os.getenv("KITE_EXCHANGE", "NSE"),
+      product=os.getenv("KITE_PRODUCT", "CNC"),
+      order_variety=os.getenv("KITE_ORDER_VARIETY", "regular"),
+    )
+  else:
+    execution = PaperExecutionAdapter()
   return Runtime(
     store=store,
     persistence=persistence,
     provider=provider,
     risk=risk,
     signal_builder=signal_builder,
-    execution=PaperExecutionAdapter(),
+    execution=execution,
     monitor=PositionMonitor(
       store=store,
       persistence=persistence,
@@ -90,9 +104,22 @@ def run_preflight() -> dict[str, object]:
   api_key = os.getenv("KITE_API_KEY", "").strip()
   access_token = os.getenv("KITE_ACCESS_TOKEN", "").strip()
   db_ok = bool(os.getenv("DATABASE_URL", "").strip())
+  live_mode = os.getenv("LIVE_ORDER_MODE", "0") == "1"
   if not api_key or not access_token:
     return {"ok": False, "message": "Missing Kite credentials", "dbConfigured": db_ok}
-  return {"ok": True, "message": "Preflight passed", "dbConfigured": db_ok}
+  if live_mode:
+    cfg = kite_config_from_env()
+    adapter = LiveKiteExecutionAdapter(
+      api_key=cfg.api_key,
+      access_token=cfg.access_token,
+      base_url=cfg.base_url,
+      exchange=os.getenv("KITE_EXCHANGE", "NSE"),
+      product=os.getenv("KITE_PRODUCT", "CNC"),
+      order_variety=os.getenv("KITE_ORDER_VARIETY", "regular"),
+    )
+    broker = adapter.preflight_check()
+    return {"ok": bool(broker.get("ok")), "message": broker.get("message"), "dbConfigured": db_ok, "mode": "live"}
+  return {"ok": True, "message": "Preflight passed", "dbConfigured": db_ok, "mode": "paper"}
 
 
 def preview_morning(symbols: list[str] | None = None) -> dict[str, object]:
@@ -138,6 +165,7 @@ def preview_morning(symbols: list[str] | None = None) -> dict[str, object]:
 
 def run_morning() -> dict[str, object]:
   rt = create_runtime()
+  rt.monitor.hydrate()
   criteria = ScreenerCriteria(
     from_date=_offset(30),
     to_date=_today(),
@@ -173,6 +201,7 @@ def run_morning() -> dict[str, object]:
         next_pos = Position(symbol=fill.symbol, qty=new_qty, avg_price=total_cost / new_qty)
         rt.store.positions[fill.symbol] = next_pos
         rt.persistence.upsert_position(next_pos)
+    rt.monitor.track_entry(fill, s)
     placed += 1
   rt.persistence.upsert_daily_snapshot(
     trade_date=_today(),
@@ -185,6 +214,57 @@ def run_morning() -> dict[str, object]:
   rt.persistence.upsert_system_state(
     "last_morning_run",
     json.dumps({"at": datetime.now(UTC).isoformat(), "placed": placed, "skipped": skipped}),
+  )
+  return {"ok": True, "placed": placed, "skipped": skipped, "positions": len(rt.store.positions)}
+
+
+def run_entry(symbols: list[str] | None = None) -> dict[str, object]:
+  rt = create_runtime()
+  criteria = ScreenerCriteria(
+    from_date=_offset(30),
+    to_date=_today(),
+    symbols=symbols if symbols else default_symbols(),
+    trend="up",
+  )
+  rows = run_screener(rt.provider, criteria)
+  signals = rt.signal_builder.build_signals(rows, rt.store.equity)
+  placed = 0
+  skipped: list[dict[str, str]] = []
+  rt.monitor.hydrate()
+  for s in signals:
+    check = rt.risk.pre_trade_check(s)
+    if not check.ok:
+      skipped.append({"symbol": s.symbol, "reason": check.reason})
+      continue
+    order, fill = rt.execution.place_signal(s)
+    rt.persistence.upsert_order(order)
+    rt.persistence.insert_fill(fill)
+    current = rt.store.positions.get(fill.symbol)
+    signed_qty = fill.qty if fill.side == "BUY" else -fill.qty
+    if current is None:
+      next_pos = Position(symbol=fill.symbol, qty=signed_qty, avg_price=fill.price)
+      rt.store.positions[fill.symbol] = next_pos
+      rt.persistence.upsert_position(next_pos)
+    else:
+      new_qty = current.qty + signed_qty
+      if new_qty <= 0:
+        rt.store.positions.pop(fill.symbol, None)
+        rt.persistence.delete_position(fill.symbol)
+      else:
+        total_cost = current.avg_price * current.qty + fill.price * signed_qty
+        next_pos = Position(symbol=fill.symbol, qty=new_qty, avg_price=total_cost / new_qty)
+        rt.store.positions[fill.symbol] = next_pos
+        rt.persistence.upsert_position(next_pos)
+    rt.monitor.track_entry(fill, s)
+    rt.risk.register_order()
+    placed += 1
+  rt.persistence.upsert_daily_snapshot(
+    trade_date=_today(),
+    equity=rt.store.equity,
+    realized_pnl=rt.store.realized_pnl,
+    unrealized_pnl=0.0,
+    open_positions=len(rt.store.positions),
+    note="entry",
   )
   return {"ok": True, "placed": placed, "skipped": skipped, "positions": len(rt.store.positions)}
 

@@ -8,7 +8,8 @@ from algo_trading_py.auth.server import kite_login_url
 from algo_trading_py.backtest.engine import BacktestConfig, run_backtest
 from algo_trading_py.config import kite_config_from_env
 from algo_trading_py.market_data.kite_historical_provider import KiteHistoricalProvider
-from algo_trading_py.pipeline import preview_morning, run_eod_close, run_monitor, run_morning, run_preflight, run_reconcile
+from algo_trading_py.live.live_loop import run_live_loop
+from algo_trading_py.pipeline import preview_morning, run_eod_close, run_entry, run_monitor, run_morning, run_preflight, run_reconcile
 from algo_trading_py.screener.service import ScreenerCriteria, default_symbols, run_screener
 
 app = typer.Typer(help="Python migration CLI for algo-trading")
@@ -75,6 +76,20 @@ def monitor() -> None:
 @app.command()
 def preflight() -> None:
   typer.echo(json.dumps(run_preflight(), indent=2))
+
+
+@app.command()
+def entry(symbols: str = typer.Option("", "--symbols", help="Optional CSV list")) -> None:
+  parsed = [x.strip().upper() for x in symbols.split(",") if x.strip()] if symbols else None
+  typer.echo(json.dumps(run_entry(parsed), indent=2))
+
+
+@app.command("live-loop")
+def live_loop(
+  interval_seconds: int = typer.Option(120, "--interval-seconds"),
+  entry_on_start: bool = typer.Option(True, "--entry-on-start/--no-entry-on-start"),
+) -> None:
+  typer.echo(json.dumps(run_live_loop(interval_seconds=interval_seconds, run_entry_on_start=entry_on_start), indent=2))
 
 
 @app.command("auth-url")
