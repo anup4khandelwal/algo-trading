@@ -24,7 +24,28 @@ Run API:
 uvicorn algo_trading_py.api.server:app --reload --port 8000
 ```
 
+Run auth callback server:
+```bash
+uvicorn algo_trading_py.auth.server:app --reload --port 8000
+```
+Get login URL:
+```bash
+algo-trading-py auth-url
+```
+Callback endpoint:
+`http://127.0.0.1:8000/kite/callback`
+
 Run screener from CLI:
 ```bash
 algo-trading-py screener --from-date 2026-02-01 --to-date 2026-02-15 --symbols INFY,TCS
+```
+
+Pipeline parity commands:
+```bash
+algo-trading-py morning
+algo-trading-py morning-preview --symbols INFY,TCS
+algo-trading-py preflight
+algo-trading-py monitor
+algo-trading-py reconcile
+algo-trading-py eod-close
 ```

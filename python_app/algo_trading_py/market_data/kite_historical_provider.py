@@ -67,3 +67,19 @@ class KiteHistoricalProvider:
         )
       )
     return bars
+
+  def get_quotes(self, instrument_keys: list[str]) -> dict[str, dict[str, float]]:
+    if not instrument_keys:
+      return {}
+    url = f"{self.base_url}/quote"
+    params: list[tuple[str, str]] = [("i", key) for key in instrument_keys]
+    res = self._client.get(url, params=params)
+    res.raise_for_status()
+    data = (res.json().get("data") or {})
+    out: dict[str, dict[str, float]] = {}
+    for key, value in data.items():
+      out[key] = {
+        "last_price": float(value.get("last_price") or 0),
+        "volume": float(value.get("volume") or 0),
+      }
+    return out

@@ -4,6 +4,14 @@ from fastapi import FastAPI, Query
 
 from algo_trading_py.config import kite_config_from_env
 from algo_trading_py.market_data.kite_historical_provider import KiteHistoricalProvider
+from algo_trading_py.pipeline import (
+  preview_morning,
+  run_eod_close,
+  run_monitor,
+  run_morning,
+  run_preflight,
+  run_reconcile,
+)
 from algo_trading_py.screener.service import ScreenerCriteria, default_symbols, run_screener
 
 app = FastAPI(title="Algo Trading Python API", version="0.1.0")
@@ -12,6 +20,17 @@ app = FastAPI(title="Algo Trading Python API", version="0.1.0")
 @app.get("/api/health")
 def health() -> dict[str, str]:
   return {"status": "ok"}
+
+
+@app.get("/api/status")
+def status() -> dict[str, object]:
+  preflight = run_preflight()
+  return {
+    "runningJob": None,
+    "liveMode": False,
+    "safeMode": {"enabled": False},
+    "lastPreflight": preflight,
+  }
 
 
 @app.get("/api/screener")
@@ -87,3 +106,35 @@ def screener(
       for r in rows
     ],
   }
+
+
+@app.get("/api/morning/preview")
+def morning_preview(symbols: str | None = None) -> dict[str, object]:
+  parsed = [x.strip().upper() for x in symbols.split(",")] if symbols else None
+  parsed = [x for x in (parsed or []) if x]
+  return preview_morning(parsed if parsed else None)
+
+
+@app.post("/api/run/morning")
+def run_morning_route() -> dict[str, object]:
+  return run_morning()
+
+
+@app.post("/api/run/monitor")
+def run_monitor_route() -> dict[str, object]:
+  return run_monitor()
+
+
+@app.post("/api/run/reconcile")
+def run_reconcile_route() -> dict[str, object]:
+  return run_reconcile()
+
+
+@app.post("/api/run/eod")
+def run_eod_route() -> dict[str, object]:
+  return run_eod_close()
+
+
+@app.post("/api/run/preflight")
+def run_preflight_route() -> dict[str, object]:
+  return run_preflight()
