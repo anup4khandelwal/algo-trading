@@ -1,84 +1,77 @@
-# Operations Runbook
+# Operations Runbook (Python)
 
 ## Daily Checklist (Market Days)
 
 ## Pre-market (8:45-9:10 IST)
-1. Ensure Postgres is up.
-2. Refresh Kite access token (`npm run auth`).
-3. Confirm `.env` risk limits and safety flags.
-4. Run live checklist:
+1. Ensure `.env` is valid and token is fresh.
+2. Generate login URL if token refresh is needed:
 ```bash
-npm run live:check
+cd python_app
+algo-trading-py auth-url
 ```
-5. Run live preflight:
+3. Run preflight:
 ```bash
-npm run preflight
+algo-trading-py preflight
 ```
-6. Run:
+4. Run morning preview:
 ```bash
-npm run morning
+algo-trading-py morning-preview --symbols INFY,TCS
+```
+5. Execute morning run:
+```bash
+algo-trading-py morning
 ```
 
 ## Intraday (9:15-15:30 IST)
-1. Start monitor loop:
+1. Start live monitor loop:
 ```bash
-npm run live
+algo-trading-py live-loop --interval-seconds 120
 ```
-2. Use UI (`npm run ui`) to watch:
-- running job state
-- positions
-- managed stops
-- broker sync time
-- scheduler state and controls
-- broker orderbook rejects and action hints
-- screener candidates (Screener page) for ad-hoc scans
+2. Optional API-driven checks:
+- `GET /api/status`
+- `GET /api/scheduler`
+- `GET /api/morning/preview`
 
 ## End-of-day
-1. If strategy requires flat book:
+1. If strategy requires flat positions:
 ```bash
-npm run eod:close
+algo-trading-py eod-close
 ```
-2. Review:
+2. Reconcile state:
 ```bash
-npm run db:report
+algo-trading-py reconcile
 ```
 
 ## Weekly Checklist
-Run analytics and export:
+1. Run backtest:
 ```bash
-npm run weekly
-npm run backtest
-npm run journal:export
+algo-trading-py backtest --from-date 2026-01-01 --to-date 2026-02-15 --symbols INFY,TCS,RELIANCE
 ```
-This executes:
-- `strategy:report`
-- `strategy:rebalance`
-- `trades:export`
-- `journal:export`
-
-Review `.env.recommended` and selectively apply updates.
+2. Review screener health:
+```bash
+algo-trading-py screener --from-date 2026-02-01 --to-date 2026-02-15 --symbols INFY,TCS,RELIANCE
+```
 
 ## Incident/Safety Procedures
 - Immediate halt:
 ```env
 HALT_TRADING=1
 ```
-- Force strict DB dependency:
+- Live-order hard gate:
 ```env
-REQUIRE_DB=1
+LIVE_ORDER_MODE=1
+CONFIRM_LIVE_ORDERS=YES
 ```
 - If repeated order failures: reduce `RISK_PER_TRADE`, tighten `ALLOWED_SYMBOLS`, lower `MAX_NOTIONAL_PER_ORDER`.
-- Reconcile state after restart:
+- Reconcile after restart:
 ```bash
-npm run reconcile
+algo-trading-py reconcile
 ```
 
 ## Common Diagnostics
-- DB: `npm run db:check`
-- Live checklist: `npm run live:check`
-- Reports: `npm run db:report`
-- Strategy health: `npm run strategy:report`
-- Backtest health: `npm run backtest`
-- Journal export: `npm run journal:export`
-- Lint checks: `npm run lint` (or `npm run lint:fix`)
-- Broker token errors: regenerate via `npm run auth`
+- Runtime status: `GET /api/status`
+- Scheduler state: `GET /api/scheduler`
+- Preflight: `algo-trading-py preflight`
+- Monitoring pass: `algo-trading-py monitor`
+- Backtest: `algo-trading-py backtest ...`
+- Broker login URL: `algo-trading-py auth-url`

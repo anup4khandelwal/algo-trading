@@ -1,78 +1,53 @@
-# Quickstart (5 Minutes)
+# Quickstart (Python, 5 Minutes)
 
-## 1) Install dependencies
+## 1) Setup environment
 ```bash
-npm install
+cd python_app
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .
 ```
 
-## 2) Configure environment
+## 2) Configure env file
 ```bash
+cd ..
 cp .env.example .env
 ```
 Set at minimum:
 - `KITE_API_KEY`
 - `KITE_API_SECRET`
-- `KITE_ACCESS_TOKEN` (refresh daily)
-- `DATABASE_URL=postgres://algo_user:algo_pass@127.0.0.1:5432/algo_trading`
+- `KITE_ACCESS_TOKEN`
+- `DATABASE_URL=postgresql://...` (if using Postgres persistence)
 
-## 3) Initialize and verify DB
+## 3) Generate Kite login URL
 ```bash
-npm run db:init
-npm run db:check
+cd python_app
+algo-trading-py auth-url
 ```
+Open the URL, complete login, and update `.env` with the token.
 
-## 4) Start auth callback server and generate access token
+## 4) Start API server
 ```bash
-npm run auth
+uvicorn algo_trading_py.api.server:app --reload --port 8000
 ```
-Open:
-```text
-https://kite.zerodha.com/connect/login?v=3&api_key=YOUR_KITE_API_KEY
-```
-After login, token is captured via callback and stored in `.env`.
+Open API docs: `http://127.0.0.1:8000/docs`
 
-## 5) Run morning workflow
+## 5) Run morning flow from CLI
 ```bash
-npm run morning
-```
-This runs:
-- DB health check
-- broker/state reconciliation
-- entry + monitor pass
-- DB report
-
-## 6) Start dashboard
-```bash
-npm run ui
-```
-Open `http://127.0.0.1:3000`.
-Use UI buttons to run morning/monitor/preflight/backtest/EOD and scheduler start/stop.
-Use `Screener` tab for custom criteria/date-range scans and send selected symbols to Morning Preview.
-
-## 7) Optional live loop
-```bash
-npm run live
+algo-trading-py preflight
+algo-trading-py morning-preview --symbols INFY,TCS
+algo-trading-py morning
 ```
 
-## 8) Optional backtest
+## 6) Start intraday monitoring
 ```bash
-npm run backtest
+algo-trading-py live-loop --interval-seconds 120
 ```
-Latest result is exported to `exports/backtest-latest.json` and shown in UI.
 
-## 9) Optional trade journal export
+## 7) Screener and backtest
 ```bash
-npm run journal:export
-```
-Exports to `exports/trade-journal.csv`.
-
-## 10) Lint checks
-```bash
-npm run lint
-```
-Optional autofix:
-```bash
-npm run lint:fix
+algo-trading-py screener --from-date 2026-02-01 --to-date 2026-02-15 --symbols INFY,TCS
+algo-trading-py backtest --from-date 2026-01-01 --to-date 2026-02-15 --symbols INFY,TCS
 ```
 
 ## Safety before live mode
@@ -80,12 +55,7 @@ Set:
 ```env
 LIVE_ORDER_MODE=1
 CONFIRM_LIVE_ORDERS=YES
-ALLOWED_SYMBOLS=CDSL,MOSCHIP
+ALLOWED_SYMBOLS=INFY,TCS,RELIANCE
 MAX_NOTIONAL_PER_ORDER=100000
-REQUIRE_DB=1
 ```
-Then run:
-```bash
-npm run live:check
-```
-Use `HALT_TRADING=1` to stop new entries immediately.
+Keep `HALT_TRADING=1` during setup and debugging.
