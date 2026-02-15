@@ -102,7 +102,8 @@ export async function runBacktest(
   const runId = `bt-${Date.now()}`;
   const config = resolveConfig(cfg);
 
-  const barsBySymbol = await loadBars(provider, config.symbols, config.from, config.to);
+  const historyFrom = dateOffsetFrom(config.from, 180);
+  const barsBySymbol = await loadBars(provider, config.symbols, historyFrom, config.from, config.to);
   const usableSymbols = Array.from(barsBySymbol.keys());
   const notes: string[] = [];
   if (usableSymbols.length === 0) {
@@ -114,7 +115,7 @@ export async function runBacktest(
     );
   }
 
-  const tradingDays = buildTradingCalendar(barsBySymbol);
+  const tradingDays = buildTradingCalendar(barsBySymbol, config.from, config.to);
   const signalBuilder = new SignalBuilder({
     minRsi: config.minRsi,
     breakoutBufferPct: config.breakoutBufferPct,
@@ -264,7 +265,8 @@ export async function runBacktest(
 async function loadBars(
   provider: KiteHistoricalProvider,
   symbols: string[],
-  from: string,
+  historyFrom: string,
+  rangeFrom: string,
   to: string
 ): Promise<Map<string, MarketBar[]>> {
   const instruments = await provider.getInstruments("NSE");
@@ -275,12 +277,16 @@ async function loadBars(
       continue;
     }
     try {
-      const bars = await provider.getHistoricalDayBars(inst.instrumentToken, from, to);
+      const bars = await provider.getHistoricalDayBars(inst.instrumentToken, historyFrom, to);
       const normalized = bars
         .map((b) => ({ ...b, symbol }))
         .filter((b) => Number.isFinite(b.close) && Number.isFinite(b.volume))
         .sort((a, b) => a.time.localeCompare(b.time));
-      if (normalized.length >= 80) {
+      const barsInRange = normalized.filter((b) => {
+        const day = b.time.slice(0, 10);
+        return day >= rangeFrom && day <= to;
+      });
+      if (barsInRange.length > 0) {
         out.set(symbol, normalized);
       }
     } catch {
@@ -290,11 +296,18 @@ async function loadBars(
   return out;
 }
 
-function buildTradingCalendar(barsBySymbol: Map<string, MarketBar[]>) {
+function buildTradingCalendar(
+  barsBySymbol: Map<string, MarketBar[]>,
+  from: string,
+  to: string
+) {
   const dates = new Set<string>();
   for (const bars of barsBySymbol.values()) {
     for (const bar of bars) {
-      dates.add(bar.time.slice(0, 10));
+      const day = bar.time.slice(0, 10);
+      if (day >= from && day <= to) {
+        dates.add(day);
+      }
     }
   }
   return Array.from(dates).sort();
@@ -552,4 +565,13 @@ function dateOffset(days: number) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
     d.getDate()
   ).padStart(2, "0")}`;
+}
+
+function dateOffsetFrom(yyyyMmDd: string, daysBack: number) {
+  const d = new Date(`${yyyyMmDd}T00:00:00.000Z`);
+  if (Number.isNaN(d.getTime())) {
+    return dateOffset(daysBack);
+  }
+  d.setUTCDate(d.getUTCDate() - daysBack);
+  return d.toISOString().slice(0, 10);
 }

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 type StatusPayload = {
   runningJob: string | null;
@@ -227,6 +227,7 @@ type EodSummaryPayload = {
 type MorningPreviewPayload = {
   generatedAt: string;
   liveMode: boolean;
+  symbolsFilter?: string[];
   preflight?: { ok?: boolean; message?: string };
   funds?: { usableEquity: number };
   summary?: { totalSignals: number; eligible: number; skipped: number };
@@ -272,6 +273,41 @@ type GttPayload = {
     brokerUpdatedAt?: string | null;
     updatedAt: string;
     lastError?: string;
+  }>;
+};
+
+type ScreenerPayload = {
+  enabled: boolean;
+  generatedAt?: string;
+  error?: string;
+  range?: { from: string; to: string };
+  criteria?: {
+    trend: string;
+    rsiMin: number;
+    rsiMax: number;
+    minVolumeRatio: number;
+    minAdv20: number;
+    minPrice: number;
+    maxPrice: number;
+    minRsScore: number;
+    breakoutOnly: boolean;
+    sortBy: string;
+    maxResults: number;
+  };
+  universe?: { requested: number; eligible: number };
+  rows: Array<{
+    symbol: string;
+    asOf: string;
+    close: number;
+    ema20: number;
+    ema50: number;
+    rsi14: number;
+    atr14: number;
+    high20: number;
+    volumeRatio: number;
+    adv20: number;
+    rsScore60d: number;
+    trend: "up" | "down" | "flat";
   }>;
 };
 
@@ -362,8 +398,60 @@ const fallbackGtt: GttPayload = {
   enabled: false,
   rows: []
 };
+const fallbackScreener: ScreenerPayload = {
+  enabled: true,
+  rows: []
+};
+const SCREENER_PRESETS = {
+  trend_breakout: {
+    label: "Trend Breakout",
+    trend: "up",
+    rsiMin: 55,
+    rsiMax: 80,
+    minVolumeRatio: 1.2,
+    minAdv20: 100000000,
+    minPrice: 50,
+    maxPrice: 10000,
+    minRsScore: 0.01,
+    breakoutOnly: true,
+    sortBy: "rs",
+    maxResults: 40
+  },
+  rsi_pullback: {
+    label: "RSI Pullback",
+    trend: "up",
+    rsiMin: 40,
+    rsiMax: 55,
+    minVolumeRatio: 1,
+    minAdv20: 75000000,
+    minPrice: 50,
+    maxPrice: 8000,
+    minRsScore: -0.1,
+    breakoutOnly: false,
+    sortBy: "rsi",
+    maxResults: 50
+  },
+  high_volume_momentum: {
+    label: "High Volume Momentum",
+    trend: "any",
+    rsiMin: 50,
+    rsiMax: 90,
+    minVolumeRatio: 1.8,
+    minAdv20: 120000000,
+    minPrice: 60,
+    maxPrice: 12000,
+    minRsScore: 0,
+    breakoutOnly: false,
+    sortBy: "volume",
+    maxResults: 50
+  }
+} as const;
+type ScreenerPresetKey = keyof typeof SCREENER_PRESETS;
 
 export default function App() {
+  const [page, setPage] = useState<"dashboard" | "config" | "screener">(
+    () => (window.location.hash === "#config" ? "config" : window.location.hash === "#screener" ? "screener" : "dashboard")
+  );
   const [status, setStatus] = useState<StatusPayload>(fallbackStatus);
   const [report, setReport] = useState<ReportPayload>(fallbackReport);
   const [health, setHealth] = useState<HealthPayload>(fallbackHealth);
@@ -380,6 +468,7 @@ export default function App() {
   const [eodSummary, setEodSummary] = useState<EodSummaryPayload>(fallbackEodSummary);
   const [pnlAttrib, setPnlAttrib] = useState<PnlAttributionPayload>(fallbackPnlAttribution);
   const [gtt, setGtt] = useState<GttPayload>(fallbackGtt);
+  const [screener, setScreener] = useState<ScreenerPayload>(fallbackScreener);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [previewBusy, setPreviewBusy] = useState(false);
   const [morningPreview, setMorningPreview] = useState<MorningPreviewPayload>(fallbackMorningPreview);
@@ -407,10 +496,48 @@ export default function App() {
   const [envFilter, setEnvFilter] = useState("");
   const [envMsg, setEnvMsg] = useState("");
   const [showSecrets, setShowSecrets] = useState(false);
+  const [screenerBusy, setScreenerBusy] = useState(false);
+  const [screenerMsg, setScreenerMsg] = useState("");
+  const [screenerPreset, setScreenerPreset] = useState<ScreenerPresetKey>("trend_breakout");
+  const [screenerFrom, setScreenerFrom] = useState(() => {
+    const d = new Date();
+    d.setDate(d.getDate() - 30);
+    return d.toISOString().slice(0, 10);
+  });
+  const [screenerTo, setScreenerTo] = useState(() => new Date().toISOString().slice(0, 10));
+  const [screenerSymbols, setScreenerSymbols] = useState("");
+  const [screenerTrend, setScreenerTrend] = useState("up");
+  const [screenerRsiMin, setScreenerRsiMin] = useState(50);
+  const [screenerRsiMax, setScreenerRsiMax] = useState(80);
+  const [screenerMinVolumeRatio, setScreenerMinVolumeRatio] = useState(1.2);
+  const [screenerMinAdv20, setScreenerMinAdv20] = useState(100000000);
+  const [screenerMinPrice, setScreenerMinPrice] = useState(50);
+  const [screenerMaxPrice, setScreenerMaxPrice] = useState(10000);
+  const [screenerMinRsScore, setScreenerMinRsScore] = useState(0.01);
+  const [screenerBreakoutOnly, setScreenerBreakoutOnly] = useState(true);
+  const [screenerSortBy, setScreenerSortBy] = useState("rs");
+  const [screenerMaxResults, setScreenerMaxResults] = useState(50);
+  const [selectedScreenerSymbols, setSelectedScreenerSymbols] = useState<Record<string, boolean>>({});
 
   const safeModeOn = status.safeMode?.enabled === true;
 
-  async function fetchJson<T>(url: string, fallback: T): Promise<T> {
+  useEffect(() => {
+    const syncPageFromHash = () => {
+      if (window.location.hash === "#config") {
+        setPage("config");
+        return;
+      }
+      if (window.location.hash === "#screener") {
+        setPage("screener");
+        return;
+      }
+      setPage("dashboard");
+    };
+    window.addEventListener("hashchange", syncPageFromHash);
+    return () => window.removeEventListener("hashchange", syncPageFromHash);
+  }, []);
+
+  const fetchJson = useCallback(async <T,>(url: string, fallback: T): Promise<T> => {
     try {
       const res = await fetch(url);
       if (!res.ok) return fallback;
@@ -418,22 +545,22 @@ export default function App() {
     } catch {
       return fallback;
     }
-  }
+  }, []);
 
-  function brokerQuery() {
+  const brokerQuery = useMemo(() => {
     const q = new URLSearchParams();
     q.set("status", statusFilter);
     q.set("severity", severityFilter);
     if (searchFilter.trim()) q.set("search", searchFilter.trim());
     return q.toString();
-  }
+  }, [searchFilter, severityFilter, statusFilter]);
 
-  async function load() {
+  const load = useCallback(async () => {
     const [s, r, h, b, st, bt, sl, dr, jr, pa, gttRows, ps, pr, env, po, eod] = await Promise.all([
       fetchJson<StatusPayload>("/api/status", fallbackStatus),
       fetchJson<ReportPayload>("/api/report", fallbackReport),
       fetchJson<HealthPayload>("/api/health", fallbackHealth),
-      fetchJson<BrokerPayload>(`/api/broker/orders?${brokerQuery()}`, fallbackBroker),
+      fetchJson<BrokerPayload>(`/api/broker/orders?${brokerQuery}`, fallbackBroker),
       fetchJson<StrategyPayload>("/api/strategy", fallbackStrategy),
       fetchJson<BacktestPayload>("/api/backtest", fallbackBacktest),
       fetchJson<StrategyLabPayload>("/api/strategy-lab/latest", fallbackStrategyLab),
@@ -474,20 +601,19 @@ export default function App() {
     setPreopen(po);
     setEodSummary(eod);
     setLastRefresh(new Date().toLocaleString("en-IN"));
-    if (!exitSymbol && (r.positions?.length ?? 0) > 0) {
-      setExitSymbol(r.positions?.[0]?.symbol ?? "");
-    }
-  }
+    setExitSymbol((prev) => {
+      if (prev || (r.positions?.length ?? 0) === 0) {
+        return prev;
+      }
+      return r.positions?.[0]?.symbol ?? "";
+    });
+  }, [brokerQuery, fetchJson]);
 
   useEffect(() => {
     void load();
     const t = setInterval(() => void load(), 10000);
     return () => clearInterval(t);
-  }, []);
-
-  useEffect(() => {
-    void load();
-  }, [statusFilter, severityFilter, searchFilter]);
+  }, [load]);
 
   async function postAction(path: string, body?: unknown) {
     setBusy(true);
@@ -503,12 +629,16 @@ export default function App() {
     }
   }
 
-  async function openMorningPreview() {
+  async function openMorningPreview(symbols?: string[]) {
     setPreviewOpen(true);
     setPreviewBusy(true);
     try {
+      const q = new URLSearchParams();
+      if (symbols && symbols.length > 0) {
+        q.set("symbols", symbols.join(","));
+      }
       const preview = await fetchJson<MorningPreviewPayload>(
-        "/api/morning/preview",
+        `/api/morning/preview${q.toString() ? `?${q.toString()}` : ""}`,
         fallbackMorningPreview
       );
       setMorningPreview(preview);
@@ -722,6 +852,152 @@ export default function App() {
     }
   }
 
+  async function runScreener() {
+    setScreenerBusy(true);
+    setScreenerMsg("");
+    try {
+      const q = new URLSearchParams();
+      q.set("from", screenerFrom);
+      q.set("to", screenerTo);
+      q.set("trend", screenerTrend);
+      q.set("rsiMin", String(screenerRsiMin));
+      q.set("rsiMax", String(screenerRsiMax));
+      q.set("minVolumeRatio", String(screenerMinVolumeRatio));
+      q.set("minAdv20", String(screenerMinAdv20));
+      q.set("minPrice", String(screenerMinPrice));
+      q.set("maxPrice", String(screenerMaxPrice));
+      q.set("minRsScore", String(screenerMinRsScore));
+      q.set("breakoutOnly", screenerBreakoutOnly ? "1" : "0");
+      q.set("sortBy", screenerSortBy);
+      q.set("maxResults", String(screenerMaxResults));
+      if (screenerSymbols.trim().length > 0) {
+        q.set("symbols", screenerSymbols.trim());
+      }
+      const res = await fetch(`/api/screener?${q.toString()}`);
+      if (!res.ok) {
+        setScreener(fallbackScreener);
+        setScreenerMsg(`Screener API failed (${res.status}). Restart backend with latest build.`);
+        return;
+      }
+      const payload = (await res.json()) as ScreenerPayload;
+      setScreener(payload);
+      setSelectedScreenerSymbols({});
+      if (payload.error) {
+        setScreenerMsg(payload.error);
+      } else if (!payload.generatedAt) {
+        setScreenerMsg("Screener response was empty. Restart backend with latest build.");
+      } else {
+        setScreenerMsg(`Found ${payload.rows?.length ?? 0} matching stocks.`);
+      }
+    } catch {
+      setScreener(fallbackScreener);
+      setScreenerMsg("Screener API unreachable. Restart backend (`npm run ui`) and try again.");
+    } finally {
+      setScreenerBusy(false);
+    }
+  }
+
+  function applyScreenerPreset(presetKey: ScreenerPresetKey) {
+    const preset = SCREENER_PRESETS[presetKey];
+    setScreenerPreset(presetKey);
+    setScreenerTrend(preset.trend);
+    setScreenerRsiMin(preset.rsiMin);
+    setScreenerRsiMax(preset.rsiMax);
+    setScreenerMinVolumeRatio(preset.minVolumeRatio);
+    setScreenerMinAdv20(preset.minAdv20);
+    setScreenerMinPrice(preset.minPrice);
+    setScreenerMaxPrice(preset.maxPrice);
+    setScreenerMinRsScore(preset.minRsScore);
+    setScreenerBreakoutOnly(preset.breakoutOnly);
+    setScreenerSortBy(preset.sortBy);
+    setScreenerMaxResults(preset.maxResults);
+    setScreenerMsg(`Applied preset: ${preset.label}`);
+  }
+
+  function toggleScreenerSelection(symbol: string) {
+    setSelectedScreenerSymbols((prev) => ({
+      ...prev,
+      [symbol]: !prev[symbol]
+    }));
+  }
+
+  function selectedScreenerList() {
+    return Object.entries(selectedScreenerSymbols)
+      .filter(([, selected]) => selected)
+      .map(([symbol]) => symbol);
+  }
+
+  function selectAllScreenerRows() {
+    const next: Record<string, boolean> = {};
+    for (const row of screener.rows ?? []) {
+      next[row.symbol] = true;
+    }
+    setSelectedScreenerSymbols(next);
+  }
+
+  function clearScreenerSelection() {
+    setSelectedScreenerSymbols({});
+  }
+
+  function exportScreenerCsv() {
+    const rows = screener.rows ?? [];
+    if (rows.length === 0) {
+      setScreenerMsg("No screener rows to export.");
+      return;
+    }
+    const headers = [
+      "symbol",
+      "asOf",
+      "trend",
+      "close",
+      "rsi14",
+      "ema20",
+      "ema50",
+      "high20",
+      "volumeRatio",
+      "adv20",
+      "rsScore60d"
+    ];
+    const lines = [
+      headers.join(","),
+      ...rows.map((x) =>
+        [
+          x.symbol,
+          x.asOf,
+          x.trend,
+          x.close.toFixed(2),
+          x.rsi14.toFixed(2),
+          x.ema20.toFixed(2),
+          x.ema50.toFixed(2),
+          x.high20.toFixed(2),
+          x.volumeRatio.toFixed(2),
+          x.adv20.toFixed(2),
+          x.rsScore60d.toFixed(4)
+        ].join(",")
+      )
+    ];
+    const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8;" });
+    const href = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = href;
+    a.download = `screener-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(href);
+    setScreenerMsg(`Exported ${rows.length} screener rows to CSV.`);
+  }
+
+  async function sendScreenerToMorningPreview() {
+    const symbols = selectedScreenerList();
+    if (symbols.length === 0) {
+      setScreenerMsg("Select at least one symbol to send.");
+      return;
+    }
+    setScreenerMsg(`Loading Morning Preview for ${symbols.length} selected symbols...`);
+    await openMorningPreview(symbols);
+  }
+
   const eqPoints = useMemo(() => {
     const rows = [...(report.dailySnapshots ?? [])].reverse();
     if (rows.length < 2) return "";
@@ -782,6 +1058,17 @@ export default function App() {
     return count;
   }, [envConfig.items, envDraft]);
 
+  const goToPage = (next: "dashboard" | "config" | "screener") => {
+    if (next === "config") {
+      window.location.hash = "config";
+    } else if (next === "screener") {
+      window.location.hash = "screener";
+    } else {
+      window.location.hash = "dashboard";
+    }
+    setPage(next);
+  };
+
   return (
     <div className="app-shell">
       <header className="hero">
@@ -801,6 +1088,29 @@ export default function App() {
         </div>
       </header>
 
+      <section className="page-nav">
+        <button
+          className={`btn ${page === "dashboard" ? "btn-primary" : ""}`}
+          onClick={() => goToPage("dashboard")}
+        >
+          Dashboard
+        </button>
+        <button
+          className={`btn ${page === "config" ? "btn-primary" : ""}`}
+          onClick={() => goToPage("config")}
+        >
+          Config (.env)
+        </button>
+        <button
+          className={`btn ${page === "screener" ? "btn-primary" : ""}`}
+          onClick={() => goToPage("screener")}
+        >
+          Screener
+        </button>
+      </section>
+
+      {page === "dashboard" ? (
+        <>
       <section className="actions">
         <button disabled={busy || safeModeOn || !preopen.ok} onClick={() => void openMorningPreview()} className="btn btn-primary">Morning</button>
         <button disabled={busy} onClick={() => void postAction("/api/run/monitor")} className="btn">Monitor</button>
@@ -862,58 +1172,6 @@ export default function App() {
           <SimpleTable columns={["control", "value"]} rows={Object.entries(profileStatus.controls ?? {}).map(([k, v]) => [k, v])} />
           <SimpleTable columns={["reasons"]} rows={(profileRec.reasons ?? []).map((x) => [x])} />
           <SimpleTable columns={["blockers"]} rows={(profileRec.blockers ?? []).map((x) => [x])} />
-        </Card>
-
-        <Card title=".env Config Editor" span="wide" subtitle={`Keys: ${envConfig.items.length} | Updated: ${new Date(envConfig.updatedAt).toLocaleString("en-IN")}`}>
-          <div className="filters env-filters">
-            <input
-              value={envFilter}
-              onChange={(e) => setEnvFilter(e.target.value)}
-              placeholder="Search key/category/description"
-            />
-            <button className="btn" disabled={busy} onClick={() => void reloadEnvEditor()}>Reload .env</button>
-            <button className="btn" disabled={busy} onClick={() => setShowSecrets((v) => !v)}>
-              {showSecrets ? "Hide Secrets" : "Show Secrets"}
-            </button>
-            <button className="btn btn-primary" disabled={busy || envChangedCount === 0} onClick={() => void saveEnvChanges()}>
-              Save Changes ({envChangedCount})
-            </button>
-          </div>
-          <div className="meta-line">
-            {envMsg || "Edit values and click Save Changes. Sensitive keys are masked by default."}
-          </div>
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>key</th>
-                  <th>value</th>
-                  <th>category</th>
-                  <th>description</th>
-                </tr>
-              </thead>
-              <tbody>
-                {envFilteredItems.slice(0, 200).map((item) => (
-                  <tr key={item.key}>
-                    <td>{item.key}</td>
-                    <td>
-                      <input
-                        className="env-input"
-                        type={item.sensitive && !showSecrets ? "password" : "text"}
-                        value={envDraft[item.key] ?? ""}
-                        onChange={(e) => {
-                          const next = e.target.value;
-                          setEnvDraft((prev) => ({ ...prev, [item.key]: next }));
-                        }}
-                      />
-                    </td>
-                    <td>{item.category}</td>
-                    <td>{item.description}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
         </Card>
 
         <Card title="Pre-Open Checklist" subtitle={`Checked: ${new Date(preopen.checkedAt).toLocaleString("en-IN")}`}>
@@ -989,7 +1247,7 @@ export default function App() {
               <option value="info">Info</option>
             </select>
             <input value={searchFilter} onChange={(e) => setSearchFilter(e.target.value)} placeholder="Search symbol/order/reason" />
-            <button className="btn" onClick={() => window.open(`/api/broker/orders.csv?${brokerQuery()}`, "_blank")}>Export CSV</button>
+            <button className="btn" onClick={() => window.open(`/api/broker/orders.csv?${brokerQuery}`, "_blank")}>Export CSV</button>
           </div>
           <div className="meta-line">
             Shown: {broker.stats?.filtered ?? 0} | Total: {broker.stats?.total ?? 0} | Rejected: {broker.stats?.rejected ?? 0} | Cancelled: {broker.stats?.cancelled ?? 0}
@@ -1277,6 +1535,235 @@ export default function App() {
           )}
         </Card>
       </section>
+        </>
+      ) : page === "config" ? (
+        <section className="grid">
+          <Card
+            title=".env Config Editor"
+            span="wide"
+            subtitle={`Keys: ${envConfig.items.length} | Updated: ${new Date(envConfig.updatedAt).toLocaleString("en-IN")}`}
+          >
+            <div className="filters env-filters">
+              <input
+                value={envFilter}
+                onChange={(e) => setEnvFilter(e.target.value)}
+                placeholder="Search key/category/description"
+              />
+              <button className="btn" disabled={busy} onClick={() => void reloadEnvEditor()}>Reload .env</button>
+              <button className="btn" disabled={busy} onClick={() => setShowSecrets((v) => !v)}>
+                {showSecrets ? "Hide Secrets" : "Show Secrets"}
+              </button>
+              <button className="btn btn-primary" disabled={busy || envChangedCount === 0} onClick={() => void saveEnvChanges()}>
+                Save Changes ({envChangedCount})
+              </button>
+            </div>
+            <div className="meta-line">
+              {envMsg || "Edit values and click Save Changes. Sensitive keys are masked by default."}
+            </div>
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>key</th>
+                    <th>value</th>
+                    <th>category</th>
+                    <th>description</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {envFilteredItems.slice(0, 200).map((item) => (
+                    <tr key={item.key}>
+                      <td>{item.key}</td>
+                      <td>
+                        <input
+                          className="env-input"
+                          type={item.sensitive && !showSecrets ? "password" : "text"}
+                          value={envDraft[item.key] ?? ""}
+                          onChange={(e) => {
+                            const next = e.target.value;
+                            setEnvDraft((prev) => ({ ...prev, [item.key]: next }));
+                          }}
+                        />
+                      </td>
+                      <td>{item.category}</td>
+                      <td>{item.description}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </Card>
+        </section>
+      ) : (
+        <section className="grid">
+          <Card
+            title="Stock Screener"
+            span="wide"
+            subtitle={`Range: ${screenerFrom} to ${screenerTo}`}
+          >
+            <div className="form-grid three-col">
+              <div className="filter-field">
+                <span>Preset Template</span>
+                <select
+                  value={screenerPreset}
+                  onChange={(e) => applyScreenerPreset(e.target.value as ScreenerPresetKey)}
+                >
+                  <option value="trend_breakout">Trend Breakout</option>
+                  <option value="rsi_pullback">RSI Pullback</option>
+                  <option value="high_volume_momentum">High Volume Momentum</option>
+                </select>
+              </div>
+              <div className="filter-field">
+                <span>From Date</span>
+                <input type="date" value={screenerFrom} onChange={(e) => setScreenerFrom(e.target.value)} />
+              </div>
+              <div className="filter-field">
+                <span>To Date</span>
+                <input type="date" value={screenerTo} onChange={(e) => setScreenerTo(e.target.value)} />
+              </div>
+              <div className="filter-field">
+                <span>Symbols (CSV)</span>
+                <input
+                  value={screenerSymbols}
+                  onChange={(e) => setScreenerSymbols(e.target.value)}
+                  placeholder="Optional e.g. INFY,TCS,RELIANCE"
+                />
+              </div>
+              <div className="filter-field">
+                <span>Trend</span>
+                <select value={screenerTrend} onChange={(e) => setScreenerTrend(e.target.value)}>
+                  <option value="up">Trend Up</option>
+                  <option value="down">Trend Down</option>
+                  <option value="any">Any Trend</option>
+                </select>
+              </div>
+              <div className="filter-field">
+                <span>Sort By</span>
+                <select value={screenerSortBy} onChange={(e) => setScreenerSortBy(e.target.value)}>
+                  <option value="rs">RS Score</option>
+                  <option value="rsi">RSI</option>
+                  <option value="volume">Volume Ratio</option>
+                  <option value="price">Price</option>
+                </select>
+              </div>
+              <div className="filter-field">
+                <span>Breakout</span>
+                <label className="toggle">
+                  <input
+                    type="checkbox"
+                    checked={screenerBreakoutOnly}
+                    onChange={(e) => setScreenerBreakoutOnly(e.target.checked)}
+                  />
+                  Near 20D high only
+                </label>
+              </div>
+              <div className="filter-field">
+                <span>RSI Min</span>
+                <input type="number" value={screenerRsiMin} onChange={(e) => setScreenerRsiMin(Number(e.target.value || 0))} />
+              </div>
+              <div className="filter-field">
+                <span>RSI Max</span>
+                <input type="number" value={screenerRsiMax} onChange={(e) => setScreenerRsiMax(Number(e.target.value || 0))} />
+              </div>
+              <div className="filter-field">
+                <span>Min Volume Ratio</span>
+                <input type="number" value={screenerMinVolumeRatio} step="0.1" onChange={(e) => setScreenerMinVolumeRatio(Number(e.target.value || 0))} />
+              </div>
+              <div className="filter-field">
+                <span>Min ADV20</span>
+                <input type="number" value={screenerMinAdv20} onChange={(e) => setScreenerMinAdv20(Number(e.target.value || 0))} />
+              </div>
+              <div className="filter-field">
+                <span>Min Price</span>
+                <input type="number" value={screenerMinPrice} onChange={(e) => setScreenerMinPrice(Number(e.target.value || 0))} />
+              </div>
+              <div className="filter-field">
+                <span>Max Price</span>
+                <input type="number" value={screenerMaxPrice} onChange={(e) => setScreenerMaxPrice(Number(e.target.value || 0))} />
+              </div>
+              <div className="filter-field">
+                <span>Min RS Score</span>
+                <input type="number" value={screenerMinRsScore} step="0.05" onChange={(e) => setScreenerMinRsScore(Number(e.target.value || 0))} />
+              </div>
+              <div className="filter-field">
+                <span>Max Results</span>
+                <input type="number" value={screenerMaxResults} onChange={(e) => setScreenerMaxResults(Number(e.target.value || 50))} />
+              </div>
+            </div>
+            <div className="actions-inline" style={{ marginTop: 10 }}>
+              <button className="btn btn-primary" disabled={screenerBusy} onClick={() => void runScreener()}>
+                {screenerBusy ? "Running..." : "Run Screener"}
+              </button>
+              <button className="btn" disabled={screenerBusy || (screener.rows?.length ?? 0) === 0} onClick={() => exportScreenerCsv()}>
+                Export CSV
+              </button>
+              <button className="btn" disabled={(screener.rows?.length ?? 0) === 0} onClick={() => selectAllScreenerRows()}>
+                Select All
+              </button>
+              <button className="btn" disabled={selectedScreenerList().length === 0} onClick={() => clearScreenerSelection()}>
+                Clear Selection
+              </button>
+              <button className="btn btn-primary" disabled={selectedScreenerList().length === 0} onClick={() => void sendScreenerToMorningPreview()}>
+                Send Selected to Morning Preview ({selectedScreenerList().length})
+              </button>
+            </div>
+            <div className="meta-line" style={{ marginTop: 10 }}>
+              {screenerMsg || "Pick criteria and run screener."}
+            </div>
+            <div className="meta-line">
+              Universe requested: {screener.universe?.requested ?? 0} | Eligible: {screener.universe?.eligible ?? 0} | Generated: {screener.generatedAt ? new Date(screener.generatedAt).toLocaleString("en-IN") : "n/a"}
+            </div>
+            {(screener.rows ?? []).length === 0 ? (
+              <div className="empty">No screener results</div>
+            ) : (
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>select</th>
+                      <th>symbol</th>
+                      <th>asOf</th>
+                      <th>trend</th>
+                      <th>close</th>
+                      <th>rsi14</th>
+                      <th>ema20</th>
+                      <th>ema50</th>
+                      <th>high20</th>
+                      <th>volRatio</th>
+                      <th>adv20</th>
+                      <th>rsScore60d</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(screener.rows ?? []).map((x) => (
+                      <tr key={x.symbol}>
+                        <td>
+                          <input
+                            type="checkbox"
+                            checked={selectedScreenerSymbols[x.symbol] === true}
+                            onChange={() => toggleScreenerSelection(x.symbol)}
+                          />
+                        </td>
+                        <td>{x.symbol}</td>
+                        <td>{x.asOf}</td>
+                        <td>{x.trend}</td>
+                        <td>{num(x.close, 2)}</td>
+                        <td>{num(x.rsi14, 2)}</td>
+                        <td>{num(x.ema20, 2)}</td>
+                        <td>{num(x.ema50, 2)}</td>
+                        <td>{num(x.high20, 2)}</td>
+                        <td>{num(x.volumeRatio, 2)}</td>
+                        <td>{inr(x.adv20)}</td>
+                        <td>{num(x.rsScore60d, 3)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </Card>
+        </section>
+      )}
 
       {previewOpen ? (
         <div className="modal-backdrop" onClick={() => !previewBusy && setPreviewOpen(false)}>
@@ -1290,6 +1777,11 @@ export default function App() {
             <div className="meta-line">
               Preflight: {morningPreview.preflight?.ok ? "PASS" : "FAIL"} | Eligible: {morningPreview.summary?.eligible ?? 0} | Skipped: {morningPreview.summary?.skipped ?? 0} | Usable Funds: {inr(morningPreview.funds?.usableEquity ?? 0)}
             </div>
+            {(morningPreview.symbolsFilter?.length ?? 0) > 0 ? (
+              <div className="meta-line">
+                Symbols filter: {(morningPreview.symbolsFilter ?? []).join(", ")}
+              </div>
+            ) : null}
             {previewBusy ? (
               <div className="empty">Loading preview...</div>
             ) : (

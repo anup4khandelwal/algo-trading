@@ -32,16 +32,20 @@ export type MorningPreviewRow = {
   reason: string;
 };
 
-export async function previewMorningOrders() {
+export async function previewMorningOrders(symbols?: string[]) {
   dotenv.config();
   const runtime = await createRuntime();
   const preflight = await runtime.exec.preflightCheck();
   const { store, signalBuilder, risk, persistence } = runtime;
-  const signals = signalBuilder.buildSignals(await runtime.screener.getCandidates(), store.equity);
+  const candidates = await runtime.screener.getCandidates();
+  const filterSet = symbols && symbols.length > 0 ? new Set(symbols.map((x) => x.trim().toUpperCase())) : null;
+  const eligibleCandidates = filterSet ? candidates.filter((x) => filterSet.has(x.symbol)) : candidates;
+  const signals = signalBuilder.buildSignals(eligibleCandidates, store.equity);
   const rows = await evaluateSignalsForPreview(signals, store, risk, persistence);
   return {
     generatedAt: new Date().toISOString(),
     liveMode: runtime.exec.isLiveMode(),
+    symbolsFilter: filterSet ? Array.from(filterSet) : [],
     preflight,
     funds: {
       usableEquity: store.equity

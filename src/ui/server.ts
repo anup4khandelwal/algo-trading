@@ -26,6 +26,9 @@ import { TradingScheduler } from "../ops/scheduler.js";
 import { ZerodhaAdapter } from "../execution/zerodha_adapter.js";
 import { MapLtpProvider } from "../market_data/ltp_provider.js";
 import { buildAlerter } from "../ops/alerter.js";
+import { KiteHistoricalProvider } from "../market_data/kite_historical_provider.js";
+import { atr, ema, pctChange, rsi, sma } from "../utils/indicators.js";
+import { asyncPool } from "../utils/async_pool.js";
 import {
   applyEnvOverrides,
   applyProfile,
@@ -270,8 +273,15 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (method === "GET" && url.pathname === "/api/screener") {
+      const screener = await runCustomScreener(url);
+      json(res, 200, screener);
+      return;
+    }
+
     if (method === "GET" && url.pathname === "/api/morning/preview") {
-      const preview = await previewMorningOrders();
+      const symbols = parseCsvQuery(url.searchParams.get("symbols"));
+      const preview = await previewMorningOrders(symbols);
       json(res, 200, preview);
       return;
     }
@@ -1949,6 +1959,173 @@ async function getBacktestReport() {
   }
 }
 
+type ScreenerRow = {
+  symbol: string;
+  asOf: string;
+  close: number;
+  ema20: number;
+  ema50: number;
+  rsi14: number;
+  atr14: number;
+  high20: number;
+  volumeRatio: number;
+  adv20: number;
+  rsScore60d: number;
+  trend: "up" | "down" | "flat";
+};
+
+async function runCustomScreener(url: URL) {
+  const apiKey = String(process.env.KITE_API_KEY ?? "").trim();
+  const accessToken = String(process.env.KITE_ACCESS_TOKEN ?? "").trim();
+  if (!apiKey || !accessToken) {
+    return {
+      enabled: false,
+      error: "Kite credentials are missing. Set KITE_API_KEY and KITE_ACCESS_TOKEN."
+    };
+  }
+
+  const from = clampDateInput(url.searchParams.get("from"), dateOffset(30));
+  const to = clampDateInput(url.searchParams.get("to"), todayDate());
+  const rangeFrom = from <= to ? from : to;
+  const rangeTo = to >= from ? to : from;
+  const historyFrom = dateOffsetFrom(rangeFrom, 180);
+
+  const symbolsParam = parseCsvQuery(url.searchParams.get("symbols"));
+  const trend = (url.searchParams.get("trend") ?? "any").toLowerCase();
+  const rsiMin = toNumber(url.searchParams.get("rsiMin"), 50);
+  const rsiMax = toNumber(url.searchParams.get("rsiMax"), 80);
+  const minVolumeRatio = toNumber(url.searchParams.get("minVolumeRatio"), 1.1);
+  const minAdv20 = toNumber(url.searchParams.get("minAdv20"), 50_000_000);
+  const minPrice = toNumber(url.searchParams.get("minPrice"), 50);
+  const maxPrice = toNumber(url.searchParams.get("maxPrice"), 10_000);
+  const minRsScore = toNumber(url.searchParams.get("minRsScore"), -0.5);
+  const breakoutOnly = (url.searchParams.get("breakoutOnly") ?? "0") === "1";
+  const maxResults = Math.max(5, Math.min(200, Math.floor(toNumber(url.searchParams.get("maxResults"), 50))));
+  const sortBy = (url.searchParams.get("sortBy") ?? "rs").toLowerCase();
+  const concurrency = Math.max(1, Math.min(10, Math.floor(toNumber(url.searchParams.get("concurrency"), 5))));
+
+  const provider = new KiteHistoricalProvider({
+    apiKey,
+    accessToken
+  });
+  const instruments = await provider.getInstruments("NSE");
+  const allSymbols = symbolsParam.length > 0 ? symbolsParam : defaultScreenerSymbols();
+  const universe = allSymbols.filter((symbol) => {
+    const inst = instruments.get(symbol);
+    return !!inst && inst.exchange === "NSE" && inst.segment === "NSE" && inst.instrumentType === "EQ";
+  });
+
+  const benchmarkRet = await loadNiftyBenchmarkReturn(provider, instruments, historyFrom, rangeTo);
+  const rowsRaw = await asyncPool(universe, concurrency, async (symbol) => {
+    const inst = instruments.get(symbol);
+    if (!inst) {
+      return null;
+    }
+    try {
+      const bars = await provider.getHistoricalDayBars(inst.instrumentToken, historyFrom, rangeTo);
+      const normalized = bars
+        .filter((b) => Number.isFinite(b.close) && Number.isFinite(b.volume))
+        .sort((a, b) => a.time.localeCompare(b.time));
+      const inRange = normalized.filter((b) => {
+        const day = b.time.slice(0, 10);
+        return day >= rangeFrom && day <= rangeTo;
+      });
+      if (inRange.length === 0 || normalized.length < 80) {
+        return null;
+      }
+      const latest = inRange[inRange.length - 1];
+      const latestIdx = normalized.findIndex((x) => x.time === latest.time);
+      if (latestIdx < 61) {
+        return null;
+      }
+      const slice = normalized.slice(0, latestIdx + 1);
+      const closes = slice.map((b) => b.close);
+      const highs = slice.map((b) => b.high);
+      const lows = slice.map((b) => b.low);
+      const volumes = slice.map((b) => b.volume);
+      const close = closes[closes.length - 1];
+      const ema20Value = ema(closes, 20);
+      const ema50Value = ema(closes, 50);
+      const rsi14Value = rsi(closes, 14);
+      const atr14Value = atr(highs, lows, closes, 14);
+      const high20 = Math.max(...highs.slice(-20));
+      const volumeRatio = sma(volumes.slice(-20)) / Math.max(1, sma(volumes.slice(-50)));
+      const adv20 = sma(closes.slice(-20).map((x, i) => x * volumes.slice(-20)[i]));
+      const rsScore60d = pctChange(closes[closes.length - 61], close) - benchmarkRet;
+      const trendLabel: "up" | "down" | "flat" =
+        close > ema20Value && ema20Value > ema50Value
+          ? "up"
+          : close < ema20Value && ema20Value < ema50Value
+            ? "down"
+            : "flat";
+
+      return {
+        symbol,
+        asOf: latest.time.slice(0, 10),
+        close,
+        ema20: ema20Value,
+        ema50: ema50Value,
+        rsi14: rsi14Value,
+        atr14: atr14Value,
+        high20,
+        volumeRatio,
+        adv20,
+        rsScore60d,
+        trend: trendLabel
+      } satisfies ScreenerRow;
+    } catch {
+      return null;
+    }
+  });
+
+  const filtered = rowsRaw
+    .filter((row): row is ScreenerRow => row !== null)
+    .filter((row) => row.close >= minPrice && row.close <= maxPrice)
+    .filter((row) => row.rsi14 >= rsiMin && row.rsi14 <= rsiMax)
+    .filter((row) => row.volumeRatio >= minVolumeRatio)
+    .filter((row) => row.adv20 >= minAdv20)
+    .filter((row) => row.rsScore60d >= minRsScore)
+    .filter((row) => (trend === "up" ? row.trend === "up" : trend === "down" ? row.trend === "down" : true))
+    .filter((row) => (breakoutOnly ? row.close >= row.high20 * 0.995 : true));
+
+  const sorted = filtered.sort((a, b) => {
+    if (sortBy === "rsi") {
+      return b.rsi14 - a.rsi14;
+    }
+    if (sortBy === "volume") {
+      return b.volumeRatio - a.volumeRatio;
+    }
+    if (sortBy === "price") {
+      return b.close - a.close;
+    }
+    return b.rsScore60d - a.rsScore60d;
+  });
+
+  return {
+    enabled: true,
+    generatedAt: new Date().toISOString(),
+    range: { from: rangeFrom, to: rangeTo },
+    criteria: {
+      trend,
+      rsiMin,
+      rsiMax,
+      minVolumeRatio,
+      minAdv20,
+      minPrice,
+      maxPrice,
+      minRsScore,
+      breakoutOnly,
+      sortBy,
+      maxResults
+    },
+    universe: {
+      requested: allSymbols.length,
+      eligible: universe.length
+    },
+    rows: sorted.slice(0, maxResults)
+  };
+}
+
 async function runStrategyLabAndPersist() {
   const output = await runStrategyLabSweep();
   const databaseUrl = process.env.DATABASE_URL;
@@ -3598,6 +3775,112 @@ function journalAnalytics(
   };
 }
 
+function defaultScreenerSymbols(): string[] {
+  const fromEnv = parseCsvQuery(process.env.SCREENER_SYMBOLS ?? "");
+  if (fromEnv.length > 0) {
+    return fromEnv;
+  }
+  return [
+    "RELIANCE",
+    "TCS",
+    "INFY",
+    "HDFCBANK",
+    "ICICIBANK",
+    "SBIN",
+    "LT",
+    "AXISBANK",
+    "KOTAKBANK",
+    "ITC",
+    "BHARTIARTL",
+    "HCLTECH",
+    "TATAMOTORS",
+    "TATASTEEL",
+    "MARUTI",
+    "SUNPHARMA",
+    "ULTRACEMCO",
+    "NTPC",
+    "POWERGRID",
+    "ADANIPORTS",
+    "BAJFINANCE",
+    "WIPRO",
+    "M&M",
+    "TECHM",
+    "INDUSINDBK",
+    "BEL",
+    "TRENT",
+    "PFC",
+    "RECLTD",
+    "ZOMATO"
+  ];
+}
+
+async function loadNiftyBenchmarkReturn(
+  provider: KiteHistoricalProvider,
+  instruments: Map<string, { instrumentToken: string }>,
+  from: string,
+  to: string
+) {
+  const nifty = instruments.get("NIFTY 50");
+  if (!nifty) {
+    return 0;
+  }
+  try {
+    const bars = await provider.getHistoricalDayBars(nifty.instrumentToken, from, to);
+    if (bars.length < 61) {
+      return 0;
+    }
+    const closes = bars.map((b) => b.close);
+    return pctChange(closes[closes.length - 61], closes[closes.length - 1]);
+  } catch {
+    return 0;
+  }
+}
+
+function parseCsvQuery(raw: string | null | undefined): string[] {
+  if (!raw) {
+    return [];
+  }
+  return raw
+    .split(",")
+    .map((x) => x.trim().toUpperCase())
+    .filter((x) => x.length > 0);
+}
+
+function clampDateInput(raw: string | null, fallback: string) {
+  if (!raw || !/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    return fallback;
+  }
+  const d = new Date(`${raw}T00:00:00.000Z`);
+  if (Number.isNaN(d.getTime())) {
+    return fallback;
+  }
+  return raw;
+}
+
+function toNumber(raw: string | null, fallback: number) {
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function todayDate() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function dateOffset(days: number) {
+  const d = new Date();
+  d.setUTCDate(d.getUTCDate() - days);
+  return d.toISOString().slice(0, 10);
+}
+
+function dateOffsetFrom(yyyyMmDd: string, daysBack: number) {
+  const d = new Date(`${yyyyMmDd}T00:00:00.000Z`);
+  if (Number.isNaN(d.getTime())) {
+    return dateOffset(daysBack);
+  }
+  d.setUTCDate(d.getUTCDate() - daysBack);
+  return d.toISOString().slice(0, 10);
+}
+
 function htmlPage() {
   return `<!doctype html>
 <html>
@@ -4680,10 +4963,10 @@ function htmlPage() {
       const alertRows = alerts.map(a => '<tr><td>' + new Date(a.created_at).toLocaleString('en-IN') + '</td><td>' + a.severity + '</td><td>' + a.type + '</td><td>' + a.message + '</td></tr>').join('');
       const recRows = reconcile.map(r => '<tr><td>' + new Date(r.created_at).toLocaleString('en-IN') + '</td><td>' + r.run_id + '</td><td>' + r.drift_count + '</td></tr>').join('');
       opsEvents.innerHTML =
-        '<div class=\"meta\" style=\"margin-bottom:8px;\">Latest alerts and reconcile audits</div>' +
-        '<table><tr><th>time</th><th>severity</th><th>type</th><th>message</th></tr>' + (alertRows || '<tr><td colspan=\"4\" class=\"empty\">No alerts</td></tr>') + '</table>' +
-        '<div style=\"height:10px;\"></div>' +
-        '<table><tr><th>time</th><th>run</th><th>drift</th></tr>' + (recRows || '<tr><td colspan=\"3\" class=\"empty\">No reconcile audits</td></tr>') + '</table>';
+        '<div class="meta" style="margin-bottom:8px;">Latest alerts and reconcile audits</div>' +
+        '<table><tr><th>time</th><th>severity</th><th>type</th><th>message</th></tr>' + (alertRows || '<tr><td colspan="4" class="empty">No alerts</td></tr>') + '</table>' +
+        '<div style="height:10px;"></div>' +
+        '<table><tr><th>time</th><th>run</th><th>drift</th></tr>' + (recRows || '<tr><td colspan="3" class="empty">No reconcile audits</td></tr>') + '</table>';
     }
 
     load();

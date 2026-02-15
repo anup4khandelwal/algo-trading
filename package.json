@@ -28,18 +28,26 @@
     "morning": "npm run db:check && npm run reconcile && npm run demo && npm run db:report",
     "weekly": "npm run strategy:report && npm run strategy:rebalance && npm run trades:export && npm run journal:export",
     "auth": "npm run build && node dist/auth/server.js",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.2",
     "@types/node": "^22.10.2",
     "@types/pg": "^8.16.0",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.4.1",
     "dotenv": "^17.2.4",
+    "eslint": "^9.39.2",
+    "eslint-plugin-react-hooks": "^7.0.1",
+    "eslint-plugin-react-refresh": "^0.5.0",
+    "globals": "^17.3.0",
     "ts-node": "^10.9.2",
     "tsx": "^4.21.0",
     "typescript": "^5.7.3",
+    "typescript-eslint": "^8.55.0",
     "vite": "^6.0.5"
   },
   "dependencies": {

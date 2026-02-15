@@ -89,6 +89,12 @@ body {
   gap: 8px;
 }
 
+.page-nav {
+  margin-top: 12px;
+  display: flex;
+  gap: 8px;
+}
+
 .btn {
   border: 1px solid var(--line);
   background: #ffffff;
@@ -245,8 +251,34 @@ body {
   gap: 8px;
 }
 
+.filter-field {
+  display: grid;
+  gap: 6px;
+}
+
+.filter-field span {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 11px;
+  color: var(--muted);
+}
+
 .form-grid.two-col {
   grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.form-grid.three-col {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.toggle {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 9px 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: #fff;
+  font-size: 13px;
 }
 
 .actions-inline {
@@ -324,4 +356,5 @@ td {
   .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .filters { grid-template-columns: 1fr; }
   .form-grid.two-col { grid-template-columns: 1fr; }
+  .form-grid.three-col { grid-template-columns: 1fr; }
 }
