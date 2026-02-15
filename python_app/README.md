@@ -1,6 +1,4 @@
-# Python Migration Baseline
-
-This folder contains the Python migration baseline for the TypeScript algo-trading project.
+# Python Runtime
 
 ## Included
 - Core domain models (`types.py`)
@@ -9,12 +7,12 @@ This folder contains the Python migration baseline for the TypeScript algo-tradi
 - Screener service (`screener/service.py`)
 - Backtest engine (`backtest/engine.py`)
 - FastAPI server with screener endpoint (`api/server.py`)
-- Typer CLI for screener/backtest (`cli.py`)
+- Typer CLI for runtime operations (`cli.py`)
 
 ## Quick start
 ```bash
 cd python_app
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
 ```
@@ -40,7 +38,7 @@ Run screener from CLI:
 algo-trading-py screener --from-date 2026-02-01 --to-date 2026-02-15 --symbols INFY,TCS
 ```
 
-Pipeline parity commands:
+Runtime commands:
 ```bash
 algo-trading-py morning
 algo-trading-py morning-preview --symbols INFY,TCS

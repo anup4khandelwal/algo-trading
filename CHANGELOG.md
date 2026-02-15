@@ -5,6 +5,31 @@ All notable changes to this project are documented in this file.
 The format is based on Keep a Changelog, and this project follows Semantic Versioning.
 
 ## [0.2.0] - 2026-02-15
+## [1.0.0] - 2026-02-15
+### Added
+- Python runtime operational parity:
+  - CLI commands (`morning`, `morning-preview`, `preflight`, `entry`, `monitor`, `reconcile`, `eod-close`, `live-loop`)
+  - FastAPI runtime endpoints for run controls and scheduler
+  - Live Kite execution adapter preflight/order flow scaffold
+  - Scheduler loop and live-loop controls
+- Python packaging and versioning via `python_app/pyproject.toml`.
+- Python CI workflow (`.github/workflows/lint.yml`) with compile validation.
+
+### Changed
+- Documentation is now Python-first across root and `docs/`.
+- Repository guidelines (`AGENTS.md`) updated for Python-only workflow.
+
+### Removed
+- TypeScript runtime source tree (`src/`).
+- React dashboard source tree (`dashboard/`).
+- Node/npm build and lint configuration:
+  - `package.json`
+  - `package-lock.json`
+  - `tsconfig.json`
+  - `eslint.config.js`
+  - generated `dist/`
+
+## [0.2.0] - 2026-02-15
 ### Added
 - Screener page in React dashboard with custom criteria/date range scan.
 - Screener presets: `Trend Breakout`, `RSI Pullback`, `High Volume Momentum`.

@@ -1,6 +1,6 @@
 [project]
 name = "algo-trading-py"
-version = "0.1.0"
+version = "1.0.0"
 description = "Python migration baseline for algo-trading"
 readme = "README.md"
 requires-python = ">=3.11"

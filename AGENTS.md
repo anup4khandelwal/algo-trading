@@ -8,7 +8,7 @@
 - Persistence layer: `python_app/algo_trading_py/persistence/`.
 - API server: `python_app/algo_trading_py/api/server.py`.
 - CLI entrypoint: `python_app/algo_trading_py/cli.py`.
-- Legacy TypeScript source remains in `src/` for reference only on this branch.
+- Repository is Python-only on this branch.
 
 ## Build, Test, and Development Commands
 - Setup:

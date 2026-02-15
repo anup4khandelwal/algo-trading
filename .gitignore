@@ -1,5 +1,6 @@
 node_modules
-/dist
-/dashboard/dist
+python_app/.venv
+__pycache__
+*.pyc
 .env
 exports/backtest-latest.json

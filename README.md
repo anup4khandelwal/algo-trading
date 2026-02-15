@@ -1,20 +1,16 @@
-# Algo Trading Platform (Python Migration Branch)
+# Algo Trading Platform (Python)
 
-This branch is the Python runtime migration of the algo-trading platform.
-
-Current Python version: `0.1.0`  
+Current Python version: `1.0.0`  
 Version source: `python_app/pyproject.toml`  
 Changelog: `CHANGELOG.md`
 
-## What is in scope on this branch
+## What is in scope
 - Python trading runtime in `python_app/algo_trading_py/`
 - CLI entrypoint: `algo-trading-py`
 - FastAPI server for screener/runtime controls
 - Live-mode guardrails (`LIVE_ORDER_MODE=1` + `CONFIRM_LIVE_ORDERS=YES`)
 - Scheduler + live loop
 - Morning preview and screener preset workflows
-
-Legacy TypeScript code still exists in the repo for reference, but active docs and commands in this branch are Python-first.
 
 ## Quick Start
 1. Create and activate a virtual environment.

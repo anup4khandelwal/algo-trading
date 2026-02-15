@@ -1,4 +1,4 @@
-name: Lint
+name: Python Checks
 
 on:
   push:
@@ -8,20 +8,21 @@ on:
   pull_request:
 
 jobs:
-  lint:
+  checks:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          node-version: 20
-          cache: npm
+          python-version: "3.11"
 
       - name: Install dependencies
-        run: npm ci
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e python_app
 
-      - name: Run lint
-        run: npm run lint
+      - name: Run compile checks
+        run: python -m compileall python_app/algo_trading_py
