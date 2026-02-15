@@ -47,6 +47,7 @@ npm run ui
 ```
 Open `http://127.0.0.1:3000`.
 Use UI buttons to run morning/monitor/preflight/backtest/EOD and scheduler start/stop.
+Use `Screener` tab for custom criteria/date-range scans and send selected symbols to Morning Preview.
 
 ## 7) Optional live loop
 ```bash
@@ -64,6 +65,15 @@ Latest result is exported to `exports/backtest-latest.json` and shown in UI.
 npm run journal:export
 ```
 Exports to `exports/trade-journal.csv`.
+
+## 10) Lint checks
+```bash
+npm run lint
+```
+Optional autofix:
+```bash
+npm run lint:fix
+```
 
 ## Safety before live mode
 Set:

@@ -110,6 +110,11 @@ npm run auth
 - profile recommendation
 
 ## 5) Dashboard Features (Screen-by-Screen)
+Top-level pages:
+- `Dashboard`: live operations and analytics cards
+- `Config (.env)`: runtime configuration editor
+- `Screener`: custom symbol scan and Morning Preview handoff
+
 ## System Health
 Shows broker/DB status, latency, token info, funds source and update time.
 Use this first every day.
@@ -208,6 +213,15 @@ Alert count > 0 means behavior divergence requires attention.
 ## Trade Journal
 Capture setup quality and mistakes.
 Review weekly for process improvement.
+
+## Screener
+Use Screener page to scan stocks by date range and criteria before market decisions.
+- filters: trend, RSI range, volume ratio, ADV20, price band, RS score, breakout-only
+- presets: `Trend Breakout`, `RSI Pullback`, `High Volume Momentum`
+- actions:
+  - run scan
+  - export scan to CSV
+  - select symbols and send to Morning Preview in one click
 
 ## Daily Equity + Funds Trend
 Charts:

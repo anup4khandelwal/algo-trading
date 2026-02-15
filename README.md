@@ -9,6 +9,9 @@ This repository is a TypeScript-based swing-trading platform for NSE equities wi
 - operational scripts,
 - web dashboard.
 
+Current release: `v0.2.0`  
+Changelog: `CHANGELOG.md`
+
 ## What Is Implemented
 
 ### Trading Engine
@@ -90,12 +93,10 @@ npm run ui
 ```
 When `dashboard/dist/index.html` exists, `npm run ui` serves React UI by default.
 
-Pages in the SaaS-style dashboard:
-- `Overview`: health, pre-open checklist, equity/funds trend, ops events
-- `Trading`: execution actions, positions, orderbook, GTT
-- `Analytics`: strategy, backtest, strategy lab, drift, journal
-- `Config`: runtime controls, profile automation, `.env` editor
-- `Billing`: product plans, checkout launcher, webhook event monitor (status/failure reasons)
+Pages in the React dashboard:
+- `Dashboard`: health, run controls, positions, orderbook, strategy/backtest/drift/journal/pnl cards
+- `Config (.env)`: dedicated page for runtime config editing
+- `Screener`: custom date range + criteria, presets, CSV export, and symbol handoff to Morning Preview
 
 ## Profile Automation (Phase 1 / 2 / 3)
 - Profile templates are stored in:
@@ -145,6 +146,8 @@ Pages in the SaaS-style dashboard:
 - `POST /api/strategy-lab/apply`: apply selected candidate params to `.env`
 - `npm run journal:export`: exports joined closed-trade + journal tags CSV
 - `npm run weekly`: report + rebalance + CSV export
+- `npm run lint`: ESLint checks for backend + dashboard
+- `npm run lint:fix`: safe ESLint autofix pass
 - UI download: `GET /api/reports/weekly.pdf` for weekly PDF summary
 
 ## Live Trading Safety
@@ -235,7 +238,26 @@ npm run journal:export
   - proposed orders (qty/entry/stop/notional/rank),
   - eligibility/skip reason per symbol,
   - preflight status and usable funds snapshot.
+- Optional symbol-scoped preview:
+  - `GET /api/morning/preview?symbols=INFY,TCS`
 - In dashboard, click **Morning** -> review preview -> **Confirm Morning Run**.
+
+## Screener (UI + API)
+- New endpoint: `GET /api/screener`
+- Query params include:
+  - `from`, `to`, `symbols`
+  - `trend=up|down|any`
+  - `rsiMin`, `rsiMax`
+  - `minVolumeRatio`, `minAdv20`
+  - `minPrice`, `maxPrice`
+  - `minRsScore`
+  - `breakoutOnly=0|1`
+  - `sortBy=rs|rsi|volume|price`
+  - `maxResults`
+- Dashboard Screener supports:
+  - presets: `Trend Breakout`, `RSI Pullback`, `High Volume Momentum`
+  - export to CSV
+  - select symbols and one-click send to Morning Preview
 
 ## Broker-Native GTT Protection
 - For live entries, app now creates a Zerodha GTT OCO (`two-leg`) immediately after BUY fill.
@@ -279,6 +301,11 @@ UI now includes **Live Health** with:
 - Kite token time-left estimate (after token generation)
 - scheduler on/off snapshot
 - recent error timeline (runtime, scheduler, critical alerts)
+
+## Versioning
+- This project follows Semantic Versioning (`MAJOR.MINOR.PATCH`).
+- Version source of truth is `package.json`.
+- Release notes are maintained in `CHANGELOG.md`.
 
 Token countdown notes:
 - `npm run auth` now updates both `KITE_ACCESS_TOKEN` and `KITE_ACCESS_TOKEN_CREATED_AT`

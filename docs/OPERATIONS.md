@@ -31,6 +31,7 @@ npm run live
 - broker sync time
 - scheduler state and controls
 - broker orderbook rejects and action hints
+- screener candidates (Screener page) for ad-hoc scans
 
 ## End-of-day
 1. If strategy requires flat book:
@@ -79,4 +80,5 @@ npm run reconcile
 - Strategy health: `npm run strategy:report`
 - Backtest health: `npm run backtest`
 - Journal export: `npm run journal:export`
+- Lint checks: `npm run lint` (or `npm run lint:fix`)
 - Broker token errors: regenerate via `npm run auth`
